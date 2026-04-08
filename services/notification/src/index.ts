@@ -1,0 +1,104 @@
+import express from 'express';
+import cors from 'cors';
+import axios from 'axios';
+import * as http from 'http';
+import { WebSocketServer, WebSocket } from 'ws';
+import * as dotenv from 'dotenv';
+import * as path from 'path';
+
+dotenv.config({ path: path.join(__dirname, '..', '..', '..', '.env') });
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+const PORT = process.env.NOTIFICATION_PORT || 4003;
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
+
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server, path: '/ws' });
+const clients = new Set<WebSocket>();
+
+wss.on('connection', (ws) => {
+  console.log(`[Notification WS] Client connected (total: ${clients.size + 1})`);
+  clients.add(ws);
+  ws.on('close', () => clients.delete(ws));
+});
+
+function broadcastEvent(event: any): void {
+  const payload = JSON.stringify(event);
+  for (const client of clients) {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(payload);
+    }
+  }
+}
+
+async function sendTelegram(message: string): Promise<boolean> {
+  if (!TELEGRAM_BOT_TOKEN || TELEGRAM_BOT_TOKEN === 'YOUR_BOT_TOKEN_HERE' || !TELEGRAM_CHAT_ID) {
+    console.warn('[Telegram] Missing credentials. Message:', message.substring(0, 80));
+    return false;
+  }
+
+  try {
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+    const res = await axios.post(url, {
+      chat_id: TELEGRAM_CHAT_ID,
+      text: message,
+      parse_mode: 'HTML'
+    }, { timeout: 10000 });
+
+    if (res.status === 200) {
+      console.log(`[Telegram] ✅ Sent: ${message.substring(0, 60)}...`);
+      return true;
+    } else {
+      console.error('[Telegram] Failed:', res.data);
+      return false;
+    }
+  } catch (err: any) {
+    console.error('[Telegram] Error:', err.message);
+    return false;
+  }
+}
+
+/**
+ * POST /api/notify
+ * Body: { type, title, message, trade? }
+ *
+ * type: 'TRADE_OPEN' | 'TRADE_CLOSE' | 'ALERT' | 'INFO'
+ */
+app.post('/api/notify', async (req, res) => {
+  try {
+    const { type, title, message, trade } = req.body;
+
+    if (!message) {
+      return res.status(400).json({ error: 'message is required' });
+    }
+
+    // Send to Telegram
+    const telegramMsg = title ? `${title}\n\n${message}` : message;
+    const sent = await sendTelegram(telegramMsg);
+
+    // Broadcast to WebSocket clients (frontend)
+    broadcastEvent({
+      type: type || 'INFO',
+      title,
+      message,
+      trade,
+      timestamp: Date.now()
+    });
+
+    res.json({ success: true, telegram: sent });
+  } catch (err) {
+    console.error('[Notification] Error:', err);
+    res.status(500).json({ error: 'Notification failed' });
+  }
+});
+
+app.get('/health', (_req, res) => res.send('OK'));
+
+server.listen(PORT, () => {
+  console.log(`[Notification] Running on :${PORT} | WS: ws://localhost:${PORT}/ws`);
+  console.log(`[Notification] Telegram: ${TELEGRAM_BOT_TOKEN ? 'Configured ✅' : 'Not configured ❌'}`);
+});

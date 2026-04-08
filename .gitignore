@@ -1,3 +1,5 @@
+.env
+
 # Raw tick data (too large for git)
 data/*.csv
 
@@ -7,3 +9,17 @@ data/*.pkl
 # Old non-prefixed JSON (legacy)
 data/chart_candles.json
 data/chart_trades.json
+
+# Node.js
+node_modules/
+.next/
+dist/
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# macOS
+.DS_Store
