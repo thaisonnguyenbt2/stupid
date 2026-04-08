@@ -1,0 +1,494 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>XAU/USD Dry Run Visualization</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
+    <style>
+        * { box-sizing: border-box; }
+        body { margin: 0; padding: 0; font-family: 'Inter', sans-serif; background: #0a0e1a; color: #e2e8f0; overflow: hidden; }
+
+        #header {
+            padding: 10px 24px; background: linear-gradient(135deg, #1a1f36 0%, #141830 100%);
+            border-bottom: 1px solid #2d3561; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;
+        }
+        .header-left { display: flex; align-items: center; gap: 16px; }
+        h1 { margin: 0; font-size: 16px; font-weight: 700; background: linear-gradient(90deg, #60a5fa, #a78bfa); -webkit-background-clip: text; -webkit-text-fill-color: transparent; white-space: nowrap; }
+
+        /* Dataset Selector */
+        .dataset-selector { display: flex; gap: 4px; }
+        .ds-btn {
+            padding: 6px 16px; border: 1px solid #2d3561; background: transparent;
+            color: #64748b; font-size: 11px; font-weight: 600; font-family: 'Inter', sans-serif;
+            cursor: pointer; transition: all 0.2s; letter-spacing: 0.5px;
+        }
+        .ds-btn:first-child { border-radius: 6px 0 0 6px; }
+        .ds-btn:last-child { border-radius: 0 6px 6px 0; }
+        .ds-btn.active {
+            background: linear-gradient(135deg, #6366f1, #4f46e5); color: #fff;
+            border-color: #6366f1; box-shadow: 0 0 12px rgba(99, 102, 241, 0.3);
+        }
+        .ds-btn:hover:not(.active) { background: rgba(99, 102, 241, 0.1); color: #a5b4fc; border-color: #4f46e5; }
+
+        .stats { display: flex; gap: 20px; flex-wrap: wrap; }
+        .stat-box { display: flex; flex-direction: column; align-items: flex-end; }
+        .stat-label { font-size: 9px; text-transform: uppercase; color: #64748b; letter-spacing: 1px; margin-bottom: 1px; }
+        .stat-value { font-size: 15px; font-weight: 700; color: #38bdf8; }
+        .positive { color: #34d399; }
+        .negative { color: #f87171; }
+
+        #main-container { display: flex; height: calc(100vh - 52px); }
+        #chart-wrapper { flex: 1; position: relative; }
+        #chart { width: 100%; height: 100%; }
+
+        /* Loading overlay */
+        #loading-overlay {
+            position: absolute; top: 0; left: 0; right: 0; bottom: 0; z-index: 50;
+            background: rgba(10, 14, 26, 0.92); display: flex; align-items: center; justify-content: center;
+            flex-direction: column; gap: 12px; transition: opacity 0.3s;
+        }
+        #loading-overlay.hidden { opacity: 0; pointer-events: none; }
+        .spinner {
+            width: 32px; height: 32px; border: 3px solid #1f2937;
+            border-top-color: #6366f1; border-radius: 50%; animation: spin 0.8s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .loading-text { font-size: 12px; color: #64748b; }
+
+        .legend {
+            position: absolute; top: 12px; left: 12px; z-index: 10;
+            background: rgba(15, 19, 35, 0.92); padding: 10px 14px; border-radius: 10px;
+            font-size: 11px; border: 1px solid #2d3561; backdrop-filter: blur(8px);
+        }
+        .legend-item { display: flex; align-items: center; margin-bottom: 4px; color: #94a3b8; }
+        .legend-item:last-child { margin-bottom: 0; }
+        .legend-color { width: 10px; height: 10px; border-radius: 2px; margin-right: 7px; flex-shrink: 0; }
+
+        /* Detail Panel */
+        #detail-panel {
+            width: 370px; min-width: 370px; background: #111827;
+            border-left: 1px solid #1f2937; overflow-y: auto; transition: all 0.3s ease;
+            display: flex; flex-direction: column;
+        }
+        #detail-panel.collapsed { width: 0; min-width: 0; border-left: none; overflow: hidden; }
+
+        .panel-header {
+            padding: 12px 18px; background: linear-gradient(135deg, #1e293b, #1a2332);
+            border-bottom: 1px solid #1f2937; display: flex; justify-content: space-between; align-items: center;
+        }
+        .panel-title { font-size: 12px; font-weight: 600; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.8px; }
+        .panel-close { cursor: pointer; color: #64748b; font-size: 18px; transition: color 0.2s; }
+        .panel-close:hover { color: #e2e8f0; }
+
+        .panel-placeholder {
+            flex: 1; display: flex; align-items: center; justify-content: center;
+            color: #475569; font-size: 13px; text-align: center; padding: 20px;
+        }
+
+        .trade-card { padding: 14px 16px; border-bottom: 1px solid #1f2937; animation: fadeIn 0.25s ease; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+
+        .trade-badge {
+            display: inline-block; padding: 3px 8px; border-radius: 4px; font-size: 10px;
+            font-weight: 700; letter-spacing: 0.5px; text-transform: uppercase;
+        }
+        .badge-long { background: rgba(16, 185, 129, 0.15); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.3); }
+        .badge-short { background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); }
+        .badge-tp { background: rgba(14, 165, 233, 0.15); color: #38bdf8; border: 1px solid rgba(14, 165, 233, 0.3); }
+        .badge-sl { background: rgba(245, 158, 11, 0.15); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.3); }
+        .badge-strat {
+            display: inline-block; padding: 3px 8px; border-radius: 4px; font-size: 10px;
+            font-weight: 600; background: rgba(96, 165, 250, 0.12); color: #93c5fd;
+            border: 1px solid rgba(96, 165, 250, 0.25); margin-left: 4px;
+        }
+
+        .card-row { display: flex; justify-content: space-between; align-items: center; margin-top: 6px; }
+        .card-key { font-size: 11px; color: #64748b; }
+        .card-val { font-size: 12px; color: #cbd5e1; font-weight: 500; font-variant-numeric: tabular-nums; }
+
+        .section-label {
+            font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px;
+            color: #475569; margin-top: 12px; margin-bottom: 4px; padding-top: 8px;
+            border-top: 1px solid #1f2937;
+        }
+
+        .rule-box {
+            background: rgba(99, 102, 241, 0.08); border: 1px solid rgba(99, 102, 241, 0.2);
+            border-radius: 6px; padding: 8px 10px; margin-top: 6px; font-size: 11px;
+            color: #a5b4fc; line-height: 1.5;
+        }
+
+        .indicator-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 3px 10px; margin-top: 6px; }
+        .indicator-item { display: flex; justify-content: space-between; padding: 2px 0; }
+        .ind-label { font-size: 10px; color: #64748b; }
+        .ind-value { font-size: 11px; color: #94a3b8; font-weight: 500; font-variant-numeric: tabular-nums; }
+
+        #panel-toggle {
+            position: absolute; top: 12px; right: 12px; z-index: 20;
+            background: rgba(15, 19, 35, 0.9); border: 1px solid #2d3561; border-radius: 8px;
+            padding: 6px 12px; cursor: pointer; font-size: 11px; color: #94a3b8;
+            transition: all 0.2s; display: none;
+        }
+        #panel-toggle:hover { background: #1e293b; color: #e2e8f0; }
+
+        .link-legend { margin-top: 8px; padding-top: 6px; border-top: 1px solid #2d3561; }
+        .link-legend .legend-color { height: 2px; width: 16px; border-radius: 1px; }
+
+        .lot-info { font-size: 10px; color: #475569; padding: 2px 0; font-style: italic; }
+
+        #detail-panel::-webkit-scrollbar { width: 5px; }
+        #detail-panel::-webkit-scrollbar-track { background: transparent; }
+        #detail-panel::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
+    </style>
+</head>
+<body>
+
+<div id="header">
+    <div class="header-left">
+        <h1>⚡ XAU/USD Execution Map</h1>
+        <div class="dataset-selector">
+            <button class="ds-btn active" onclick="switchDataset('202601')" id="btn-202601">Jan 2026</button>
+            <button class="ds-btn" onclick="switchDataset('202602')" id="btn-202602">Feb 2026</button>
+            <button class="ds-btn" onclick="switchDataset('202603')" id="btn-202603">Mar 2026</button>
+        </div>
+    </div>
+    <div class="stats" id="stats-container"></div>
+</div>
+
+<div id="main-container">
+    <div id="chart-wrapper">
+        <div id="loading-overlay">
+            <div class="spinner"></div>
+            <div class="loading-text">Loading dataset...</div>
+        </div>
+        <div class="legend">
+            <div class="legend-item"><div class="legend-color" style="background:#34d399;"></div> LONG Entry</div>
+            <div class="legend-item"><div class="legend-color" style="background:#f87171;"></div> SHORT Entry</div>
+            <div class="legend-item"><div class="legend-color" style="background:#38bdf8; border-radius:50%"></div> Take Profit</div>
+            <div class="legend-item"><div class="legend-color" style="background:#fbbf24; border-radius:50%"></div> Stop Loss</div>
+            <div class="link-legend">
+                <div class="legend-item"><div class="legend-color" style="background:#34d399;"></div> Entry → TP link</div>
+                <div class="legend-item"><div class="legend-color" style="background:#f87171;"></div> Entry → SL link</div>
+            </div>
+            <div class="lot-info">Sizing: 0.01 lot (1 oz)</div>
+        </div>
+        <button id="panel-toggle" onclick="togglePanel()">☰ Trades</button>
+        <div id="chart"></div>
+    </div>
+
+    <div id="detail-panel">
+        <div class="panel-header">
+            <span class="panel-title">Trade Inspector</span>
+            <span class="panel-close" onclick="togglePanel()">✕</span>
+        </div>
+        <div id="panel-content">
+            <div class="panel-placeholder">Click any marker on the chart<br>to inspect trade details</div>
+        </div>
+    </div>
+</div>
+
+<script>
+    let allTrades = [];
+    let selectedTradeIdx = -1;
+    let activeLineSeries = [];
+    let candleSeries = null;
+    let chart = null;
+    let currentDataset = '202601';
+    let markerToTradeMap = {};
+
+    function togglePanel() {
+        const panel = document.getElementById('detail-panel');
+        const btn = document.getElementById('panel-toggle');
+        panel.classList.toggle('collapsed');
+        btn.style.display = panel.classList.contains('collapsed') ? 'block' : 'none';
+        if (chart) {
+            setTimeout(() => chart.resize(document.getElementById('chart-wrapper').clientWidth, document.getElementById('chart-wrapper').clientHeight), 350);
+        }
+    }
+
+    function formatTime(unix) {
+        const d = new Date(unix * 1000);
+        return d.toISOString().replace('T', ' ').substring(0, 19) + ' UTC';
+    }
+
+    function clearActiveLines() {
+        activeLineSeries.forEach(s => { try { chart.removeSeries(s); } catch(e) {} });
+        activeLineSeries = [];
+    }
+
+    function drawEntryExitLine(trade) {
+        clearActiveLines();
+        const isWin = trade.pnl > 0;
+        const color = isWin ? 'rgba(52, 211, 153, 0.6)' : 'rgba(248, 113, 113, 0.6)';
+
+        const lineSeries = chart.addLineSeries({
+            color: color, lineWidth: 2, lineStyle: 2,
+            crosshairMarkerVisible: false, priceLineVisible: false, lastValueVisible: false,
+        });
+        lineSeries.setData([
+            { time: trade.time, value: trade.entry },
+            { time: trade.exit_time, value: trade.exit }
+        ]);
+        activeLineSeries.push(lineSeries);
+
+        const tpLine = chart.addLineSeries({
+            color: 'rgba(56, 189, 248, 0.35)', lineWidth: 1, lineStyle: 1,
+            crosshairMarkerVisible: false, priceLineVisible: false, lastValueVisible: false,
+        });
+        tpLine.setData([
+            { time: trade.time, value: trade.tp },
+            { time: trade.exit_time, value: trade.tp }
+        ]);
+        activeLineSeries.push(tpLine);
+
+        const slLine = chart.addLineSeries({
+            color: 'rgba(251, 191, 36, 0.35)', lineWidth: 1, lineStyle: 1,
+            crosshairMarkerVisible: false, priceLineVisible: false, lastValueVisible: false,
+        });
+        slLine.setData([
+            { time: trade.time, value: trade.sl },
+            { time: trade.exit_time, value: trade.sl }
+        ]);
+        activeLineSeries.push(slLine);
+
+        const entryLine = chart.addLineSeries({
+            color: 'rgba(148, 163, 184, 0.3)', lineWidth: 1, lineStyle: 3,
+            crosshairMarkerVisible: false, priceLineVisible: false, lastValueVisible: false,
+        });
+        entryLine.setData([
+            { time: trade.time, value: trade.entry },
+            { time: trade.exit_time, value: trade.entry }
+        ]);
+        activeLineSeries.push(entryLine);
+    }
+
+    function showTradeDetail(trade, idx) {
+        if (idx === selectedTradeIdx) return;
+        selectedTradeIdx = idx;
+        const panel = document.getElementById('panel-content');
+        const isWin = trade.pnl > 0;
+        const m = trade.meta || {};
+
+        drawEntryExitLine(trade);
+
+        const skipKeys = ['rule', 'tp_mult', 'sl_mult'];
+        const metaKeys = Object.keys(m).filter(k => !skipKeys.includes(k));
+        let indicatorHtml = '';
+        if (metaKeys.length > 0) {
+            indicatorHtml = '<div class="indicator-grid">';
+            metaKeys.forEach(k => {
+                const label = k.replace(/_/g, ' ').toUpperCase();
+                indicatorHtml += `
+                    <div class="indicator-item">
+                        <span class="ind-label">${label}</span>
+                        <span class="ind-value">${typeof m[k] === 'number' ? m[k].toLocaleString(undefined, {maximumFractionDigits: 3}) : m[k]}</span>
+                    </div>`;
+            });
+            indicatorHtml += '</div>';
+        }
+
+        panel.innerHTML = `
+            <div class="trade-card">
+                <div style="margin-bottom:4px;">
+                    <span class="trade-badge ${trade.dir === 'LONG' ? 'badge-long' : 'badge-short'}">${trade.dir}</span>
+                    <span class="badge-strat">${trade.strat}</span>
+                    <span class="trade-badge ${isWin ? 'badge-tp' : 'badge-sl'}" style="margin-left:4px">${trade.status === 'CLOSED_TP' ? 'TP HIT' : 'SL HIT'}</span>
+                    <span style="float:right;font-size:10px;color:#475569;">Trade #${idx}</span>
+                </div>
+
+                <div class="section-label">📋 Entry Conditions</div>
+                ${m.rule ? `<div class="rule-box">${m.rule}</div>` : ''}
+
+                <div class="section-label">📍 Order Details</div>
+                <div class="card-row"><span class="card-key">Entry Price</span><span class="card-val">${trade.entry}</span></div>
+                <div class="card-row"><span class="card-key">Entry Time</span><span class="card-val">${formatTime(trade.time)}</span></div>
+                <div class="card-row"><span class="card-key">Take Profit</span><span class="card-val" style="color:#38bdf8">${trade.tp}</span></div>
+                <div class="card-row"><span class="card-key">Stop Loss</span><span class="card-val" style="color:#fbbf24">${trade.sl}</span></div>
+                <div class="card-row"><span class="card-key">TP Formula</span><span class="card-val">entry ± M5_ATR × ${m.tp_mult || '—'}</span></div>
+                <div class="card-row"><span class="card-key">SL Formula</span><span class="card-val">entry ∓ M5_ATR × ${m.sl_mult || '—'}</span></div>
+                <div class="card-row"><span class="card-key">Lot Size</span><span class="card-val">0.01 lot (1 oz)</span></div>
+
+                <div class="section-label">🏁 Exit Details</div>
+                <div class="card-row"><span class="card-key">Exit Price</span><span class="card-val">${trade.exit}</span></div>
+                <div class="card-row"><span class="card-key">Exit Time</span><span class="card-val">${formatTime(trade.exit_time)}</span></div>
+                <div class="card-row"><span class="card-key">Hold Duration</span><span class="card-val">${trade.duration_mins} min</span></div>
+                <div class="card-row">
+                    <span class="card-key">Net PnL (0.01 lot)</span>
+                    <span class="card-val ${trade.pnl >= 0 ? 'positive' : 'negative'}" style="font-size:14px;font-weight:700;">$${trade.pnl.toFixed(2)}</span>
+                </div>
+
+                <div class="section-label">📊 Indicator Snapshot at Entry</div>
+                ${indicatorHtml || '<div style="color:#475569;font-size:11px;">No indicator data</div>'}
+            </div>
+        `;
+    }
+
+    async function switchDataset(dsId) {
+        if (dsId === currentDataset && chart) return;
+        currentDataset = dsId;
+
+        // Update button states
+        document.querySelectorAll('.ds-btn').forEach(b => b.classList.remove('active'));
+        document.getElementById(`btn-${dsId}`).classList.add('active');
+
+        // Show loading
+        const overlay = document.getElementById('loading-overlay');
+        overlay.classList.remove('hidden');
+
+        // Reset state
+        selectedTradeIdx = -1;
+        document.getElementById('panel-content').innerHTML = '<div class="panel-placeholder">Click any marker on the chart<br>to inspect trade details</div>';
+
+        // Destroy existing chart
+        if (chart) {
+            chart.remove();
+            chart = null;
+            candleSeries = null;
+            activeLineSeries = [];
+        }
+
+        await loadData(dsId);
+        overlay.classList.add('hidden');
+    }
+
+    async function loadData(dsId) {
+        try {
+            const [candlesRes, tradesRes] = await Promise.all([
+                fetch(`chart_candles_${dsId}.json`),
+                fetch(`chart_trades_${dsId}.json`)
+            ]);
+
+            if (!candlesRes.ok || !tradesRes.ok) {
+                throw new Error(`Dataset ${dsId} not found. Run: python dry_run_xau.py ${dsId}`);
+            }
+
+            const candles = await candlesRes.json();
+            allTrades = await tradesRes.json();
+
+            // Stats
+            let totalPnL = 0, wins = 0;
+            allTrades.forEach(t => { totalPnL += t.pnl; if (t.pnl > 0) wins++; });
+            const wr = (wins / allTrades.length * 100).toFixed(1);
+
+            const stratCounts = {};
+            const stratPnl = {};
+            allTrades.forEach(t => {
+                stratCounts[t.strat] = (stratCounts[t.strat] || 0) + 1;
+                stratPnl[t.strat] = (stratPnl[t.strat] || 0) + t.pnl;
+            });
+            let stratHtml = '';
+            for (const [s, c] of Object.entries(stratCounts)) {
+                const sp = stratPnl[s];
+                stratHtml += `
+                    <div class="stat-box">
+                        <span class="stat-label">${s}</span>
+                        <span class="stat-value" style="font-size:12px;">${c} <span style="font-size:10px;color:${sp>=0?'#34d399':'#f87171'}">($${sp.toFixed(0)})</span></span>
+                    </div>`;
+            }
+
+            const months = {'202601':'Jan 2026','202602':'Feb 2026','202603':'Mar 2026'};
+            document.getElementById('stats-container').innerHTML = `
+                <div class="stat-box"><span class="stat-label">${months[dsId] || dsId} – Trades</span><span class="stat-value">${allTrades.length}</span></div>
+                <div class="stat-box"><span class="stat-label">Win Rate</span><span class="stat-value">${wr}%</span></div>
+                <div class="stat-box"><span class="stat-label">Net PnL (0.01 lot)</span><span class="stat-value ${totalPnL >= 0 ? 'positive' : 'negative'}">$${totalPnL.toFixed(2)}</span></div>
+                ${stratHtml}
+            `;
+
+            // Chart
+            chart = LightweightCharts.createChart(document.getElementById('chart'), {
+                layout: { background: { type: 'solid', color: '#0a0e1a' }, textColor: '#64748b' },
+                grid: { vertLines: { color: '#141830' }, horzLines: { color: '#141830' } },
+                timeScale: { timeVisible: true, secondsVisible: false, borderColor: '#1f2937' },
+                rightPriceScale: { borderColor: '#1f2937' },
+                crosshair: { mode: LightweightCharts.CrosshairMode.Normal }
+            });
+
+            candleSeries = chart.addCandlestickSeries({
+                upColor: '#10b981', downColor: '#ef4444',
+                borderVisible: false,
+                wickUpColor: '#10b981', wickDownColor: '#ef4444'
+            });
+            candleSeries.setData(candles);
+
+            // Build markers
+            const markers = [];
+            const usedTimes = new Set();
+            markerToTradeMap = {};
+
+            allTrades.forEach((t, idx) => {
+                let t_entry = t.time;
+                while (usedTimes.has(t_entry)) { t_entry += 1; }
+                usedTimes.add(t_entry);
+                markerToTradeMap[t_entry] = idx;
+
+                markers.push({
+                    time: t_entry,
+                    position: t.dir === 'LONG' ? 'belowBar' : 'aboveBar',
+                    color: t.dir === 'LONG' ? '#34d399' : '#f87171',
+                    shape: t.dir === 'LONG' ? 'arrowUp' : 'arrowDown',
+                    text: `${t.strat}`,
+                });
+
+                if (t.status.startsWith('CLOSED')) {
+                    let t_exit = t.exit_time;
+                    while (usedTimes.has(t_exit)) { t_exit += 1; }
+                    usedTimes.add(t_exit);
+                    markerToTradeMap[t_exit] = idx;
+
+                    const isWin = t.pnl > 0;
+                    markers.push({
+                        time: t_exit,
+                        position: t.dir === 'LONG' ? (isWin ? 'aboveBar' : 'belowBar') : (isWin ? 'belowBar' : 'aboveBar'),
+                        color: isWin ? '#38bdf8' : '#fbbf24',
+                        shape: 'circle',
+                        text: `${isWin ? 'TP' : 'SL'} $${t.pnl.toFixed(2)}`,
+                    });
+                }
+            });
+
+            markers.sort((a, b) => a.time - b.time);
+            candleSeries.setMarkers(markers);
+
+            // Click handler
+            chart.subscribeClick(param => {
+                if (!param || !param.time) return;
+                let closestIdx = -1, closestDist = Infinity;
+                for (const [mTime, tIdx] of Object.entries(markerToTradeMap)) {
+                    const dist = Math.abs(Number(mTime) - param.time);
+                    if (dist < closestDist) { closestDist = dist; closestIdx = tIdx; }
+                }
+                if (closestIdx >= 0 && closestDist <= 300) {
+                    showTradeDetail(allTrades[closestIdx], closestIdx);
+                }
+            });
+
+            chart.subscribeCrosshairMove(param => {
+                if (!param || !param.time) return;
+                let closestIdx = -1, closestDist = Infinity;
+                for (const [mTime, tIdx] of Object.entries(markerToTradeMap)) {
+                    const dist = Math.abs(Number(mTime) - param.time);
+                    if (dist < closestDist) { closestDist = dist; closestIdx = tIdx; }
+                }
+                if (closestIdx >= 0 && closestDist <= 60) {
+                    showTradeDetail(allTrades[closestIdx], closestIdx);
+                }
+            });
+
+            window.addEventListener('resize', () => {
+                if (chart) chart.resize(document.getElementById('chart-wrapper').clientWidth, document.getElementById('chart-wrapper').clientHeight);
+            });
+
+        } catch (err) {
+            console.error("Error:", err);
+            document.getElementById('stats-container').innerHTML = `<div style="color:#f87171;font-size:13px;">Error: ${err.message}</div>`;
+            document.getElementById('loading-overlay').classList.add('hidden');
+        }
+    }
+
+    // Load default dataset
+    switchDataset('202601');
+</script>
+</body>
+</html>

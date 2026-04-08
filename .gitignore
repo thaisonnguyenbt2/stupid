@@ -1,0 +1,9 @@
+# Raw tick data (too large for git)
+data/*.csv
+
+# Pickle caches (regenerated from CSV)
+data/*.pkl
+
+# Old non-prefixed JSON (legacy)
+data/chart_candles.json
+data/chart_trades.json
