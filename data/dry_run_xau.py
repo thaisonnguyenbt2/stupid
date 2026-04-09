@@ -90,7 +90,7 @@ def attach_indicators(df, prefix=''):
         df.columns = [f"{c}_{prefix}" if c not in ['open', 'high', 'low', 'close', 'volume'] else f"{c}_{prefix}" for c in df.columns]
     return df
 
-def run_dry_run(dataset_id=None):
+def run_dry_run(dataset_id=None, trend_filter=True):
     # ------------------------------------------------------------------
     # Dataset resolution
     # ------------------------------------------------------------------
@@ -191,6 +191,29 @@ def run_dry_run(dataset_id=None):
         # Avoid entries if ATR is functionally 0 (dead market)
         if m5_atrs[i] < 0.05: continue 
         
+        # ==================== M5 TREND STRENGTH FILTER ====================
+        # Check 3 M5 candles back (~15 min) for strong directional bias
+        m5_trend_bias = 'NEUTRAL'
+        if i >= 15:  # Need ≥15 M1 bars = 3 M5 candles of lookback
+            prev_idx = i - 15
+            ema9_slope = m5_e9s[i] - m5_e9s[prev_idx]
+            ema21_slope = m5_e21s[i] - m5_e21s[prev_idx]
+            
+            if (ema9_slope < 0 and ema21_slope < 0 and
+                m5_closes[i] < m5_e9s[i] and m5_closes[i] < m5_e21s[i] and
+                m5_e9s[i] < m5_e21s[i]):
+                m5_trend_bias = 'BEAR_STRONG'
+            elif (ema9_slope > 0 and ema21_slope > 0 and
+                  m5_closes[i] > m5_e9s[i] and m5_closes[i] > m5_e21s[i] and
+                  m5_e9s[i] > m5_e21s[i]):
+                m5_trend_bias = 'BULL_STRONG'
+
+        def is_counter_trend(direction):
+            if not trend_filter: return False
+            if m5_trend_bias == 'BEAR_STRONG' and direction == 'LONG': return True
+            if m5_trend_bias == 'BULL_STRONG' and direction == 'SHORT': return True
+            return False
+
         # 1. STRATEGY A: EMA Trend Pullback (M5 Context -> M1 Pullback)
         if t - last_ema_t > COOLDOWN:
             m5_bull = m5_e9s[i] > m5_e21s[i] > m5_e50s[i]
@@ -202,7 +225,7 @@ def run_dry_run(dataset_id=None):
             elif m5_bear and highs[i] >= m1_e21s[i] and rsis[i] >= 55:
                 direction = 'SHORT'
                 
-            if direction:
+            if direction and not is_counter_trend(direction):
                 last_ema_t = t
                 tp_dist = m5_atrs[i] * tp_mult
                 sl_dist = m5_atrs[i] * sl_mult
@@ -225,6 +248,7 @@ def run_dry_run(dataset_id=None):
                     'm5_atr': round(m5_atrs[i], 3),
                     'tp_mult': tp_mult,
                     'sl_mult': sl_mult,
+                    'm5_trend': m5_trend_bias,
                 }
                 executed_orders.append({'strat': 'EMA_PULLBACK', 'dir': direction, 'entry': live_price, 'time': t, 'tp': tp, 'sl': sl, 'status': 'PENDING', 'meta': meta})
 
@@ -241,7 +265,7 @@ def run_dry_run(dataset_id=None):
                 direction = 'LONG'
                 bb_trigger = f"M1 Low ({round(lows[i],3)}) < Lower BB ({round(lowers[i],3)}), RSI {round(rsis[i],2)} <= 25"
                 
-            if direction:
+            if direction and not is_counter_trend(direction):
                 last_bb_t = t
                 tp_dist = m5_atrs[i] * 2.0  # Tighter TP for reversals
                 sl_dist = m5_atrs[i] * 1.5
@@ -259,6 +283,7 @@ def run_dry_run(dataset_id=None):
                     'm5_atr': round(m5_atrs[i], 3),
                     'tp_mult': 2.0,
                     'sl_mult': 1.5,
+                    'm5_trend': m5_trend_bias,
                 }
                 executed_orders.append({'strat': 'BB_REVERSION', 'dir': direction, 'entry': live_price, 'time': t, 'tp': tp, 'sl': sl, 'status': 'PENDING', 'meta': meta})
 
@@ -278,7 +303,7 @@ def run_dry_run(dataset_id=None):
                     if highs[i] >= m5_e9s[i]:
                         direction = 'SHORT'
                         
-            if direction:
+            if direction and not is_counter_trend(direction):
                 last_inst_t = t
                 tp_dist = m5_atrs[i] * 4.0  # Massive TP expectation for institutional sweeps
                 sl_dist = m5_atrs[i] * 1.0  # Extremely tight risk since institutional bounds protect it
@@ -299,6 +324,7 @@ def run_dry_run(dataset_id=None):
                     'm5_rsi': round(m5_rsis[i], 2),
                     'tp_mult': 4.0,
                     'sl_mult': 1.0,
+                    'm5_trend': m5_trend_bias,
                 }
                 executed_orders.append({'strat': 'INST_BREAKOUT', 'dir': direction, 'entry': live_price, 'time': t, 'tp': tp, 'sl': sl, 'status': 'PENDING', 'meta': meta})
 
@@ -441,7 +467,73 @@ def run_dry_run(dataset_id=None):
 if __name__ == "__main__":
     ds = sys.argv[1] if len(sys.argv) > 1 else None
     
-    if ds == 'all':
+    if ds == 'compare':
+        # Run both WITH and WITHOUT trend filter for comparison
+        datasets = ['202601', '202602', '202603']
+        
+        print("\n" + "="*80)
+        print("  RUNNING WITHOUT TREND FILTER")
+        print("="*80)
+        no_filter = []
+        for d in datasets:
+            result = run_dry_run(d, trend_filter=False)
+            if result:
+                no_filter.append((d, *result))
+
+        print("\n" + "="*80)
+        print("  RUNNING WITH TREND FILTER")
+        print("="*80)
+        with_filter = []
+        for d in datasets:
+            result = run_dry_run(d, trend_filter=True)
+            if result:
+                with_filter.append((d, *result))
+
+        # Build comparison table
+        print("\n")
+        print("╔" + "═"*78 + "╗")
+        print("║" + "  M5 TREND FILTER — BEFORE vs AFTER COMPARISON".center(78) + "║")
+        print("╠" + "═"*78 + "╣")
+        print("║" + "  Dataset  │  WITHOUT Filter        │  WITH Filter           │  Delta".ljust(78) + "║")
+        print("╠" + "═"*78 + "╣")
+        
+        total_before = 0
+        total_after = 0
+        total_trades_before = 0
+        total_trades_after = 0
+        
+        nf_dict = {d: (p, w, c) for d, p, w, c in no_filter}
+        wf_dict = {d: (p, w, c) for d, p, w, c in with_filter}
+        
+        for d in datasets:
+            if d in nf_dict and d in wf_dict:
+                bp, bw, bc = nf_dict[d]
+                ap, aw, ac = wf_dict[d]
+                delta_pnl = ap - bp
+                delta_trades = ac - bc
+                delta_sign = "+" if delta_pnl >= 0 else ""
+                total_before += bp
+                total_after += ap
+                total_trades_before += bc
+                total_trades_after += ac
+                line = f"  {d}    │  ${bp:8.2f} WR:{bw:4.1f}% #{bc:4d} │  ${ap:8.2f} WR:{aw:4.1f}% #{ac:4d} │ {delta_sign}${delta_pnl:.2f}"
+                print("║" + line.ljust(78) + "║")
+        
+        print("╠" + "═"*78 + "╣")
+        total_delta = total_after - total_before
+        trades_delta = total_trades_after - total_trades_before
+        delta_sign = "+" if total_delta >= 0 else ""
+        line = f"  TOTAL    │  ${total_before:8.2f}       #{total_trades_before:4d} │  ${total_after:8.2f}       #{total_trades_after:4d} │ {delta_sign}${total_delta:.2f}"
+        print("║" + line.ljust(78) + "║")
+        print("╠" + "═"*78 + "╣")
+        
+        pct_improvement = ((total_after - total_before) / abs(total_before) * 100) if total_before != 0 else 0
+        blocked = total_trades_before - total_trades_after
+        line2 = f"  Filter blocked {blocked} counter-trend trades → PnL {delta_sign}{pct_improvement:.1f}% improvement"
+        print("║" + line2.ljust(78) + "║")
+        print("╚" + "═"*78 + "╝")
+        
+    elif ds == 'all':
         print("\n" + "#"*60)
         print("  RUNNING ALL DATASETS")
         print("#"*60)

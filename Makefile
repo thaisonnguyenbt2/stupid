@@ -67,7 +67,7 @@ endif
 
 dry-run-all:
 	@echo "[Dry Run] Running analyzer backtest against ALL datasets..."
-	bash -c 'cd services/analyzer && source venv/bin/activate && python dry_run.py all'
+	bash -c 'cd data && source ../services/analyzer/venv/bin/activate && python dry_run_xau.py all'
 
 chart:
 	@echo "[Chart] Serving Dry Run Visualization at http://localhost:8000"

@@ -250,12 +250,49 @@ def run_strategies(db):
     now = time.time()
     live_price = get_live_price(db) or m1_close
 
+    # ==================== M5 TREND STRENGTH FILTER ====================
+    # Compute M5 EMA slope to detect strong directional trends.
+    # When the M5 trend is strongly one-directional, block ALL counter-trend entries
+    # (including mean reversion) to avoid "catching a falling knife."
+    m5_trend_bias = 'NEUTRAL'  # BULL_STRONG, BEAR_STRONG, or NEUTRAL
+
+    # Check if we have enough M5 history for slope calculation
+    if len(df_m5) >= 6:
+        m5_prev = df_m5.iloc[-4]  # 3 M5 candles back (15 min)
+        if not pd.isna(m5_prev['ema9']) and not pd.isna(m5_prev['ema21']):
+            ema9_slope = m5_ema9 - m5_prev['ema9']
+            ema21_slope = m5_ema21 - m5_prev['ema21']
+
+            # Strong bearish: EMAs falling, price below both, EMA9 < EMA21
+            if (ema9_slope < 0 and ema21_slope < 0 and
+                m5_close < m5_ema9 and m5_close < m5_ema21 and
+                m5_ema9 < m5_ema21):
+                m5_trend_bias = 'BEAR_STRONG'
+
+            # Strong bullish: EMAs rising, price above both, EMA9 > EMA21
+            elif (ema9_slope > 0 and ema21_slope > 0 and
+                  m5_close > m5_ema9 and m5_close > m5_ema21 and
+                  m5_ema9 > m5_ema21):
+                m5_trend_bias = 'BULL_STRONG'
+
+    if m5_trend_bias != 'NEUTRAL':
+        print(f"[Trend Filter] M5 bias: {m5_trend_bias} | EMA9: {m5_ema9:.2f} | EMA21: {m5_ema21:.2f} | Close: {m5_close:.2f}")
+
     def find_prepare(signal_type):
         return db.paper_trades.find_one({'signalType': signal_type, 'status': 'PREPARE', 'symbol': SYMBOL})
 
     def promote(prepare_doc, meta_new):
         direction = prepare_doc['direction']
         signal_type = prepare_doc['signalType']
+        # Block promotion if it would be counter-trend
+        if m5_trend_bias == 'BEAR_STRONG' and direction == 'LONG':
+            print(f"[Trend Filter] Blocked {signal_type} LONG promotion — M5 strongly bearish")
+            db.paper_trades.update_one({'_id': prepare_doc['_id']}, {'$set': {'status': 'EXPIRED', 'closeReason': 'TREND_FILTER'}})
+            return
+        if m5_trend_bias == 'BULL_STRONG' and direction == 'SHORT':
+            print(f"[Trend Filter] Blocked {signal_type} SHORT promotion — M5 strongly bullish")
+            db.paper_trades.update_one({'_id': prepare_doc['_id']}, {'$set': {'status': 'EXPIRED', 'closeReason': 'TREND_FILTER'}})
+            return
         tp_dist = abs(prepare_doc['tp'] - prepare_doc['entryPrice'])
         sl_dist = abs(prepare_doc['sl'] - prepare_doc['entryPrice'])
         new_tp = live_price + tp_dist if direction == 'LONG' else live_price - tp_dist
@@ -273,6 +310,13 @@ def run_strategies(db):
         print(f"[Promote] {signal_type} {direction} PREPARE → OPEN at {live_price:.3f}")
 
     def create_prepare(signal_type, direction, tp, sl, meta):
+        # Block PREPARE if counter-trend
+        if m5_trend_bias == 'BEAR_STRONG' and direction == 'LONG':
+            print(f"[Trend Filter] Blocked {signal_type} LONG prepare — M5 strongly bearish")
+            return
+        if m5_trend_bias == 'BULL_STRONG' and direction == 'SHORT':
+            print(f"[Trend Filter] Blocked {signal_type} SHORT prepare — M5 strongly bullish")
+            return
         trade_doc = {
             'symbol': SYMBOL, 'direction': direction, 'status': 'PREPARE',
             'entryPrice': round(live_price, 3), 'tp': round(tp, 3), 'sl': round(sl, 3),
@@ -283,6 +327,16 @@ def run_strategies(db):
         msg = format_trade_message('⏳ PREPARE', direction, live_price, signal_type, meta)
         notify('TRADE_PREPARE', f"⏳ {signal_type} {direction} — Conditions forming", msg, trade_doc)
         print(f"[Prepare] {signal_type} {direction} at {live_price:.3f} — watching for entry")
+
+    def is_counter_trend(direction, signal_type):
+        """Return True if this direction fights the strong M5 trend."""
+        if m5_trend_bias == 'BEAR_STRONG' and direction == 'LONG':
+            print(f"[Trend Filter] Blocked {signal_type} LONG — M5 strongly bearish")
+            return True
+        if m5_trend_bias == 'BULL_STRONG' and direction == 'SHORT':
+            print(f"[Trend Filter] Blocked {signal_type} SHORT — M5 strongly bullish")
+            return True
+        return False
 
     # ==================== STRATEGY A: EMA Trend Pullback ====================
     if now - last_ema_time > COOLDOWN_SECS:
@@ -296,7 +350,7 @@ def run_strategies(db):
         elif m5_bear and m1_high >= m1_ema21 and m1_rsi >= 55:
             full_dir = 'SHORT'
 
-        if full_dir:
+        if full_dir and not is_counter_trend(full_dir, 'EMA_PULLBACK'):
             last_ema_time = now
             tp_dist = m5_atr * 3.0
             sl_dist = m5_atr * 1.2
@@ -358,7 +412,7 @@ def run_strategies(db):
             full_dir = 'LONG'
             bb_trigger = f"M1 Low ({m1_low:.3f}) < Lower BB ({m1_lower_bb:.3f}), RSI {m1_rsi:.1f} <= 25"
 
-        if full_dir:
+        if full_dir and not is_counter_trend(full_dir, 'BB_REVERSION'):
             last_bb_time = now
             tp_dist = m5_atr * 2.0
             sl_dist = m5_atr * 1.5
@@ -417,7 +471,7 @@ def run_strategies(db):
             elif m5_close < m5_lower_bb and m1_high >= m5_ema9:
                 full_dir = 'SHORT'
 
-        if full_dir:
+        if full_dir and not is_counter_trend(full_dir, 'INST_BREAKOUT'):
             last_inst_time = now
             tp_dist = m5_atr * 4.0
             sl_dist = m5_atr * 1.0
