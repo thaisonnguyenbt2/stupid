@@ -1,0 +1,36 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: analyzer
+  namespace: trading-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: analyzer
+  template:
+    metadata:
+      labels:
+        app: analyzer
+    spec:
+      containers:
+      - name: analyzer
+        image: trading-analyzer:latest
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 4002
+        envFrom:
+        - secretRef:
+            name: trading-secrets
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: analyzer
+  namespace: trading-system
+spec:
+  ports:
+  - port: 4002
+    targetPort: 4002
+  selector:
+    app: analyzer

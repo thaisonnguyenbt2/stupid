@@ -171,11 +171,11 @@ def get_live_price(db):
     return candle['close'] if candle else None
 
 
-def format_trade_message(action, direction, price, strategy, meta):
+def format_trade_message(action, direction, price, tp, sl, strategy, meta):
     """Format a trade notification message."""
     emoji = '🟢' if direction == 'LONG' else '🔴'
     lines = [
-        f"{emoji} <b>{action} | {direction} | ${price:.2f}</b>",
+        f"{emoji} <b>{action} {direction} | Entry: ${price:.2f} | TP: ${tp:.2f} | SL: ${sl:.2f}</b>",
         f"Strategy: <b>{strategy}</b>",
         f"Lot: 0.01 (1 oz)",
         ""
@@ -195,14 +195,7 @@ def run_strategies(db):
     """Execute all 3 strategies with two-stage PREPARE → OPEN flow. Called every 5s."""
     global last_ema_time, last_bb_time, last_inst_time
 
-    # Expire old PREPARE signals (15 min TTL)
-    cutoff = int((time.time() - 900) * 1000)
-    expired = db.paper_trades.update_many(
-        {'status': 'PREPARE', 'entryTime': {'$lt': cutoff}},
-        {'$set': {'status': 'EXPIRED', 'closeReason': 'PREPARE_TIMEOUT'}}
-    )
-    if expired.modified_count > 0:
-        print(f"[Prepare] Expired {expired.modified_count} stale PREPARE signal(s)")
+    # (PREPARE logic removed — strategies enter OPEN directly)
 
     df_m1 = load_candles(db, SYMBOL, 500)
     if df_m1 is None or len(df_m1) < 50:
@@ -295,55 +288,6 @@ def run_strategies(db):
     if m5_trend_bias != 'NEUTRAL':
         print(f"[Trend Filter] M5 bias: {m5_trend_bias} | EMA9: {m5_ema9:.2f} | EMA21: {m5_ema21:.2f} | Close: {m5_close:.2f}")
 
-    def find_prepare(signal_type):
-        return db.paper_trades.find_one({'signalType': signal_type, 'status': 'PREPARE', 'symbol': SYMBOL})
-
-    def promote(prepare_doc, meta_new):
-        direction = prepare_doc['direction']
-        signal_type = prepare_doc['signalType']
-        # Block promotion if it would be counter-trend
-        if m5_trend_bias == 'BEAR_STRONG' and direction == 'LONG':
-            print(f"[Trend Filter] Blocked {signal_type} LONG promotion — M5 strongly bearish")
-            db.paper_trades.update_one({'_id': prepare_doc['_id']}, {'$set': {'status': 'EXPIRED', 'closeReason': 'TREND_FILTER'}})
-            return
-        if m5_trend_bias == 'BULL_STRONG' and direction == 'SHORT':
-            print(f"[Trend Filter] Blocked {signal_type} SHORT promotion — M5 strongly bullish")
-            db.paper_trades.update_one({'_id': prepare_doc['_id']}, {'$set': {'status': 'EXPIRED', 'closeReason': 'TREND_FILTER'}})
-            return
-        tp_dist = abs(prepare_doc['tp'] - prepare_doc['entryPrice'])
-        sl_dist = abs(prepare_doc['sl'] - prepare_doc['entryPrice'])
-        new_tp = live_price + tp_dist if direction == 'LONG' else live_price - tp_dist
-        new_sl = live_price - sl_dist if direction == 'LONG' else live_price + sl_dist
-        db.paper_trades.update_one(
-            {'_id': prepare_doc['_id']},
-            {'$set': {
-                'status': 'OPEN', 'entryPrice': round(live_price, 3),
-                'tp': round(new_tp, 3), 'sl': round(new_sl, 3),
-                'entryTime': int(now * 1000), 'meta': meta_new, 'promotedFrom': 'PREPARE',
-            }}
-        )
-        msg = format_trade_message('ORDER LIVE 🔥', direction, live_price, signal_type, meta_new)
-        notify('TRADE_OPEN', f"🔥 {signal_type} {direction} — NOW LIVE", msg)
-        print(f"[Promote] {signal_type} {direction} PREPARE → OPEN at {live_price:.3f}")
-
-    def create_prepare(signal_type, direction, tp, sl, meta):
-        # Block PREPARE if counter-trend
-        if m5_trend_bias == 'BEAR_STRONG' and direction == 'LONG':
-            print(f"[Trend Filter] Blocked {signal_type} LONG prepare — M5 strongly bearish")
-            return
-        if m5_trend_bias == 'BULL_STRONG' and direction == 'SHORT':
-            print(f"[Trend Filter] Blocked {signal_type} SHORT prepare — M5 strongly bullish")
-            return
-        trade_doc = {
-            'symbol': SYMBOL, 'direction': direction, 'status': 'PREPARE',
-            'entryPrice': round(live_price, 3), 'tp': round(tp, 3), 'sl': round(sl, 3),
-            'entryTime': int(now * 1000),
-            'signalType': signal_type, 'meta': meta, 'lotSize': LOT_SIZE,
-        }
-        db.paper_trades.insert_one(trade_doc)
-        msg = format_trade_message('⏳ PREPARE', direction, live_price, signal_type, meta)
-        notify('TRADE_PREPARE', f"⏳ {signal_type} {direction} — Conditions forming", msg, trade_doc)
-        print(f"[Prepare] {signal_type} {direction} at {live_price:.3f} — watching for entry")
 
     def is_counter_trend(direction, signal_type):
         """Return True if this direction fights the strong M5 trend."""
@@ -380,43 +324,16 @@ def run_strategies(db):
                 'm5_ema50': round(m5_ema50, 3), 'm5_atr': round(m5_atr, 3),
                 'tp_mult': 3.0, 'sl_mult': 1.2,
             }
-            prep = find_prepare('EMA_PULLBACK')
-            if prep:
-                promote(prep, meta)
-            else:
-                trade_doc = {
-                    'symbol': SYMBOL, 'direction': full_dir, 'status': 'OPEN',
-                    'entryPrice': round(live_price, 3), 'tp': round(tp, 3), 'sl': round(sl, 3),
-                    'entryTime': int(now * 1000),
-                    'signalType': 'EMA_PULLBACK', 'meta': meta, 'lotSize': LOT_SIZE,
-                }
-                db.paper_trades.insert_one(trade_doc)
-                msg = format_trade_message('NEW ORDER', full_dir, live_price, 'EMA_PULLBACK', meta)
-                notify('TRADE_OPEN', f"📐 EMA Pullback {full_dir}", msg, trade_doc)
-                print(f"[Strategy A] {full_dir} at {live_price:.3f} | TP: {tp:.3f} | SL: {sl:.3f}")
-        else:
-            # --- PREPARE: EMA aligned but price approaching pullback zone ---
-            prep_dir = None
-            if m5_bull and m1_close <= m1_ema21 + m5_atr * 1.5 and m1_rsi <= 55:
-                prep_dir = 'LONG'
-            elif m5_bear and m1_close >= m1_ema21 - m5_atr * 1.5 and m1_rsi >= 45:
-                prep_dir = 'SHORT'
-
-            if prep_dir and not find_prepare('EMA_PULLBACK'):
-                tp_dist = m5_atr * 3.0
-                sl_dist = m5_atr * 1.2
-                tp = live_price + tp_dist if prep_dir == 'LONG' else live_price - tp_dist
-                sl = live_price - sl_dist if prep_dir == 'LONG' else live_price + sl_dist
-                dist = abs(m1_close - m1_ema21)
-                meta = {
-                    'rule': f"M5 EMA {'9>21>50 BULL' if m5_bull else '9<21<50 BEAR'} ✓, Price ${dist:.2f} from EMA21, RSI {m1_rsi:.1f} approaching zone",
-                    'm1_rsi': round(m1_rsi, 2), 'm1_ema21': round(m1_ema21, 3),
-                    'm1_close': round(m1_close, 3), 'dist_to_trigger': round(dist, 3),
-                    'm5_ema9': round(m5_ema9, 3), 'm5_ema21': round(m5_ema21, 3),
-                    'm5_ema50': round(m5_ema50, 3), 'm5_atr': round(m5_atr, 3),
-                    'tp_mult': 3.0, 'sl_mult': 1.2,
-                }
-                create_prepare('EMA_PULLBACK', prep_dir, tp, sl, meta)
+            trade_doc = {
+                'symbol': SYMBOL, 'direction': full_dir, 'status': 'OPEN',
+                'entryPrice': round(live_price, 3), 'tp': round(tp, 3), 'sl': round(sl, 3),
+                'entryTime': int(now * 1000),
+                'signalType': 'EMA_PULLBACK', 'meta': meta, 'lotSize': LOT_SIZE,
+            }
+            db.paper_trades.insert_one(trade_doc)
+            msg = format_trade_message('NEW ORDER', full_dir, live_price, tp, sl, 'EMA_PULLBACK', meta)
+            notify('TRADE_OPEN', f"📐 EMA Pullback {full_dir}", msg, trade_doc)
+            print(f"[Strategy A] {full_dir} at {live_price:.3f} | TP: {tp:.3f} | SL: {sl:.3f}")
 
     # ==================== STRATEGY B: Bollinger Mean Reversion ====================
     if now - last_bb_time > COOLDOWN_SECS:
@@ -440,42 +357,16 @@ def run_strategies(db):
                 'm1_upper_bb': round(m1_upper_bb, 3), 'm1_lower_bb': round(m1_lower_bb, 3),
                 'm5_atr': round(m5_atr, 3), 'tp_mult': 2.0, 'sl_mult': 1.5,
             }
-            prep = find_prepare('BB_REVERSION')
-            if prep:
-                promote(prep, meta)
-            else:
-                trade_doc = {
-                    'symbol': SYMBOL, 'direction': full_dir, 'status': 'OPEN',
-                    'entryPrice': round(live_price, 3), 'tp': round(tp, 3), 'sl': round(sl, 3),
-                    'entryTime': int(now * 1000),
-                    'signalType': 'BB_REVERSION', 'meta': meta, 'lotSize': LOT_SIZE,
-                }
-                db.paper_trades.insert_one(trade_doc)
-                msg = format_trade_message('NEW ORDER', full_dir, live_price, 'BB_REVERSION', meta)
-                notify('TRADE_OPEN', f"📊 BB Reversion {full_dir}", msg, trade_doc)
-                print(f"[Strategy B] {full_dir} at {live_price:.3f} | TP: {tp:.3f} | SL: {sl:.3f}")
-        else:
-            # --- PREPARE: price near BB, RSI approaching extreme ---
-            prep_dir = None
-            bb_prep = ''
-            if m1_high > m1_upper_bb - m5_atr * 0.5 and m1_rsi >= 65:
-                prep_dir = 'SHORT'
-                bb_prep = f"Price near Upper BB (within {m5_atr*0.5:.2f}), RSI {m1_rsi:.1f} → 75"
-            elif m1_low < m1_lower_bb + m5_atr * 0.5 and m1_rsi <= 35:
-                prep_dir = 'LONG'
-                bb_prep = f"Price near Lower BB (within {m5_atr*0.5:.2f}), RSI {m1_rsi:.1f} → 25"
-
-            if prep_dir and not find_prepare('BB_REVERSION'):
-                tp_dist = m5_atr * 2.0
-                sl_dist = m5_atr * 1.5
-                tp = live_price + tp_dist if prep_dir == 'LONG' else live_price - tp_dist
-                sl = live_price - sl_dist if prep_dir == 'LONG' else live_price + sl_dist
-                meta = {
-                    'rule': bb_prep, 'm1_rsi': round(m1_rsi, 2),
-                    'm1_upper_bb': round(m1_upper_bb, 3), 'm1_lower_bb': round(m1_lower_bb, 3),
-                    'm5_atr': round(m5_atr, 3), 'tp_mult': 2.0, 'sl_mult': 1.5,
-                }
-                create_prepare('BB_REVERSION', prep_dir, tp, sl, meta)
+            trade_doc = {
+                'symbol': SYMBOL, 'direction': full_dir, 'status': 'OPEN',
+                'entryPrice': round(live_price, 3), 'tp': round(tp, 3), 'sl': round(sl, 3),
+                'entryTime': int(now * 1000),
+                'signalType': 'BB_REVERSION', 'meta': meta, 'lotSize': LOT_SIZE,
+            }
+            db.paper_trades.insert_one(trade_doc)
+            msg = format_trade_message('NEW ORDER', full_dir, live_price, tp, sl, 'BB_REVERSION', meta)
+            notify('TRADE_OPEN', f"📊 BB Reversion {full_dir}", msg, trade_doc)
+            print(f"[Strategy B] {full_dir} at {live_price:.3f} | TP: {tp:.3f} | SL: {sl:.3f}")
 
     # ==================== STRATEGY C: Institutional Breakout ====================
     if now - last_inst_time > COOLDOWN_SECS:
@@ -500,41 +391,68 @@ def run_strategies(db):
                 'm5_close': round(m5_close, 3), 'm5_ema9': round(m5_ema9, 3),
                 'm5_atr': round(m5_atr, 3), 'tp_mult': 4.0, 'sl_mult': 1.0,
             }
-            prep = find_prepare('INST_BREAKOUT')
-            if prep:
-                promote(prep, meta)
-            else:
-                trade_doc = {
-                    'symbol': SYMBOL, 'direction': full_dir, 'status': 'OPEN',
-                    'entryPrice': round(live_price, 3), 'tp': round(tp, 3), 'sl': round(sl, 3),
-                    'entryTime': int(now * 1000),
-                    'signalType': 'INST_BREAKOUT', 'meta': meta, 'lotSize': LOT_SIZE,
-                }
-                db.paper_trades.insert_one(trade_doc)
-                msg = format_trade_message('NEW ORDER', full_dir, live_price, 'INST_BREAKOUT', meta)
-                notify('TRADE_OPEN', f"🏦 Inst. Breakout {full_dir}", msg, trade_doc)
-                print(f"[Strategy C] {full_dir} at {live_price:.3f} | TP: {tp:.3f} | SL: {sl:.3f}")
-        else:
-            # --- PREPARE: volume building, price approaching BB ---
-            prep_dir = None
-            if vol_ratio > 1.5:
-                if m5_close > m5_upper_bb - m5_atr * 0.5:
-                    prep_dir = 'LONG'
-                elif m5_close < m5_lower_bb + m5_atr * 0.5:
-                    prep_dir = 'SHORT'
+            trade_doc = {
+                'symbol': SYMBOL, 'direction': full_dir, 'status': 'OPEN',
+                'entryPrice': round(live_price, 3), 'tp': round(tp, 3), 'sl': round(sl, 3),
+                'entryTime': int(now * 1000),
+                'signalType': 'INST_BREAKOUT', 'meta': meta, 'lotSize': LOT_SIZE,
+            }
+            db.paper_trades.insert_one(trade_doc)
+            msg = format_trade_message('NEW ORDER', full_dir, live_price, tp, sl, 'INST_BREAKOUT', meta)
+            notify('TRADE_OPEN', f"🏦 Inst. Breakout {full_dir}", msg, trade_doc)
+            print(f"[Strategy C] {full_dir} at {live_price:.3f} | TP: {tp:.3f} | SL: {sl:.3f}")
 
-            if prep_dir and not find_prepare('INST_BREAKOUT'):
-                tp_dist = m5_atr * 4.0
-                sl_dist = m5_atr * 1.0
-                tp = live_price + tp_dist if prep_dir == 'LONG' else live_price - tp_dist
-                sl = live_price - sl_dist if prep_dir == 'LONG' else live_price + sl_dist
-                meta = {
-                    'rule': f"M5 Vol building ({vol_ratio:.1f}x → 2.0x), M5 close approaching {'Upper BB' if prep_dir == 'LONG' else 'Lower BB'}",
-                    'm5_volume': round(m5_vol, 0), 'm5_vol_ratio': round(vol_ratio, 2),
-                    'm5_close': round(m5_close, 3), 'm5_ema9': round(m5_ema9, 3),
-                    'm5_atr': round(m5_atr, 3), 'tp_mult': 4.0, 'sl_mult': 1.0,
-                }
-                create_prepare('INST_BREAKOUT', prep_dir, tp, sl, meta)
+# ===================== REAL-TIME BROADCAST =====================
+
+def get_frontend_payload(db):
+    """Generate the full data payload for the frontend (trades, livePrice, indicators)."""
+    trades = list(db.paper_trades.find().sort('entryTime', -1).limit(200))
+    for t in trades:
+        t['_id'] = str(t['_id'])
+        # Convert any remaining ObjectId/datetime fields
+        for k, v in t.items():
+            if hasattr(v, '__str__') and type(v).__name__ in ('ObjectId', 'datetime'):
+                t[k] = str(v)
+                
+    live = get_live_price(db)
+    
+    # Compute current indicators for live display
+    indicators = {}
+    df_m1 = load_candles(db, SYMBOL, 100)
+    if df_m1 is not None and len(df_m1) >= 20:
+        df_m1 = attach_indicators(df_m1)
+        df_m5 = resample_m5(df_m1)
+        if len(df_m5) >= 20:
+            df_m5 = attach_indicators(df_m5)
+            m5_last = df_m5.iloc[-2] if len(df_m5) >= 2 else df_m5.iloc[-1]
+            m1_last = df_m1.iloc[-2] if len(df_m1) >= 2 else df_m1.iloc[-1]
+            indicators = {
+                'm1_rsi': round(float(m1_last['rsi']), 2) if not pd.isna(m1_last['rsi']) else None,
+                'm1_ema21': round(float(m1_last['ema21']), 3) if not pd.isna(m1_last['ema21']) else None,
+                'm1_upper_bb': round(float(m1_last['upper_bb']), 3) if not pd.isna(m1_last['upper_bb']) else None,
+                'm1_lower_bb': round(float(m1_last['lower_bb']), 3) if not pd.isna(m1_last['lower_bb']) else None,
+                'm5_ema9': round(float(m5_last['ema9']), 3) if not pd.isna(m5_last['ema9']) else None,
+                'm5_ema21': round(float(m5_last['ema21']), 3) if not pd.isna(m5_last['ema21']) else None,
+                'm5_ema50': round(float(m5_last['ema50']), 3) if not pd.isna(m5_last['ema50']) else None,
+                'm5_rsi': round(float(m5_last['rsi']), 2) if not pd.isna(m5_last['rsi']) else None,
+                'm5_atr': round(float(m5_last['atr']), 3) if not pd.isna(m5_last['atr']) else None,
+            }
+
+    return {
+        'trades': trades,
+        'livePrice': live,
+        'indicators': indicators,
+    }
+
+def broadcast_trades(db):
+    """Broadcast the full trade state via notification WS for real-time frontend updates."""
+    try:
+        payload = get_frontend_payload(db)
+        payload['type'] = 'TRADES_UPDATE'
+
+        requests.post(NOTIFICATION_URL, json=payload, timeout=2)
+    except Exception:
+        pass  # Non-critical — frontend falls back to polling
 
 
 # ===================== TP/SL MONITOR =====================
@@ -663,34 +581,8 @@ def start_api(db):
                 self._send_json({'status': 'ok'})
 
             elif parsed.path == '/api/paper-trades':
-                trades = list(db.paper_trades.find().sort('entryTime', -1).limit(200))
-                for t in trades:
-                    t['_id'] = str(t['_id'])
-                live = get_live_price(db)
-
-                # Compute current indicators for live display
-                indicators = {}
-                df_m1 = load_candles(db, SYMBOL, 100)
-                if df_m1 is not None and len(df_m1) >= 20:
-                    df_m1 = attach_indicators(df_m1)
-                    df_m5 = resample_m5(df_m1)
-                    if len(df_m5) >= 20:
-                        df_m5 = attach_indicators(df_m5)
-                        m5_last = df_m5.iloc[-2] if len(df_m5) >= 2 else df_m5.iloc[-1]
-                        m1_last = df_m1.iloc[-2] if len(df_m1) >= 2 else df_m1.iloc[-1]
-                        indicators = {
-                            'm1_rsi': round(float(m1_last['rsi']), 2) if not pd.isna(m1_last['rsi']) else None,
-                            'm1_ema21': round(float(m1_last['ema21']), 3) if not pd.isna(m1_last['ema21']) else None,
-                            'm1_upper_bb': round(float(m1_last['upper_bb']), 3) if not pd.isna(m1_last['upper_bb']) else None,
-                            'm1_lower_bb': round(float(m1_last['lower_bb']), 3) if not pd.isna(m1_last['lower_bb']) else None,
-                            'm5_ema9': round(float(m5_last['ema9']), 3) if not pd.isna(m5_last['ema9']) else None,
-                            'm5_ema21': round(float(m5_last['ema21']), 3) if not pd.isna(m5_last['ema21']) else None,
-                            'm5_ema50': round(float(m5_last['ema50']), 3) if not pd.isna(m5_last['ema50']) else None,
-                            'm5_rsi': round(float(m5_last['rsi']), 2) if not pd.isna(m5_last['rsi']) else None,
-                            'm5_atr': round(float(m5_last['atr']), 3) if not pd.isna(m5_last['atr']) else None,
-                        }
-
-                self._send_json({'trades': trades, 'livePrice': live, 'indicators': indicators})
+                payload = get_frontend_payload(db)
+                self._send_json(payload)
 
             elif parsed.path == '/api/paper-trades/stats':
                 closed = list(db.paper_trades.find({'status': 'CLOSED'}))
@@ -757,8 +649,9 @@ def main():
         try:
             now = time.time()
 
-            # Monitor TP/SL every second
+            # Monitor TP/SL every second, then broadcast state
             monitor_trades(db)
+            broadcast_trades(db)
 
             # Run strategies every 5 seconds
             if now - last_strategy_run >= STRATEGY_INTERVAL:

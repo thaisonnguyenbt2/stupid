@@ -1,4 +1,9 @@
+ifneq (,$(wildcard ./.env))
+    include .env
+endif
+
 .PHONY: dev dev-frontend dev-ingest dev-analyzer dev-notification install clean-ghosts chart
+
 
 clean-ghosts:
 	@echo "Killing ghost processes..."
@@ -74,3 +79,38 @@ chart:
 	@lsof -ti:8000 | xargs kill -9 2>/dev/null || true
 	python3 data/serve_ui.py
 
+# ===================== KUBERNETES & GITOPS =====================
+
+k8s-build:
+	@echo "Building microservices into local Docker..."
+	docker build -t trading-frontend:latest ./frontend
+	docker build -t trading-analyzer:latest ./services/analyzer
+	docker build -t trading-data-ingest:latest ./services/data-ingest
+	docker build -t trading-notification:latest ./services/notification
+
+k8s-deploy: k8s-build
+	@echo "Deploying newly built images to local cluster..."
+	kubectl rollout restart deployment frontend analyzer data-ingest notification -n trading-system
+
+# ===================== ORACLE CLOUD (OCI) =====================
+
+ocl-login:
+	@echo "Authenticating with Oracle Cloud..."
+	oci session authenticate || oci setup config
+
+ocl-provision:
+	@echo "Launching Oracle Cloud Instance with cloud-init.yaml payload..."
+	oci compute instance launch \
+		--compartment-id $(OCL_COMPARTMENT_ID) \
+		--subnet-id $(OCL_SUBNET_ID) \
+		--image-id $(OCL_IMAGE_ID) \
+		--availability-domain $(OCL_AVAILABILITY_DOMAIN) \
+		--shape $(OCL_SHAPE) \
+		--shape-config '{"Ocpus": $(OCL_OCPUS), "MemoryInGBs": $(OCL_MEMORY)}' \
+		--assign-public-ip true \
+		--display-name "trading-k3s-node" \
+		--user-data-file cloud-init.yaml
+
+ocl-provision-auto:
+	@echo "Starting Oracle Capacity Auto-Retrier..."
+	@bash scripts/oci-retry.sh

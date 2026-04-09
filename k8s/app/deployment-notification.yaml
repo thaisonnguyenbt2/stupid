@@ -1,0 +1,36 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notification
+  namespace: trading-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: notification
+  template:
+    metadata:
+      labels:
+        app: notification
+    spec:
+      containers:
+      - name: notification
+        image: trading-notification:latest
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 4003
+        envFrom:
+        - secretRef:
+            name: trading-secrets
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: notification
+  namespace: trading-system
+spec:
+  ports:
+  - port: 4003
+    targetPort: 4003
+  selector:
+    app: notification

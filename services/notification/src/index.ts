@@ -70,15 +70,19 @@ async function sendTelegram(message: string): Promise<boolean> {
  */
 app.post('/api/notify', async (req, res) => {
   try {
-    const { type, title, message, trade } = req.body;
+    const { type, title, message, trade, trades, livePrice } = req.body;
 
-    if (!message) {
+    if (!message && type !== 'TRADES_UPDATE') {
       return res.status(400).json({ error: 'message is required' });
     }
 
-    // Send to Telegram
-    const telegramMsg = title ? `${title}\n\n${message}` : message;
-    const sent = await sendTelegram(telegramMsg);
+    let sent = false;
+
+    // Skip Telegram for bulk state broadcasts (TRADES_UPDATE)
+    if (type !== 'TRADES_UPDATE') {
+      const telegramMsg = title ? `${title}\n\n${message}` : message;
+      sent = await sendTelegram(telegramMsg);
+    }
 
     // Broadcast to WebSocket clients (frontend)
     broadcastEvent({
@@ -86,6 +90,8 @@ app.post('/api/notify', async (req, res) => {
       title,
       message,
       trade,
+      trades,       // Full trade list for TRADES_UPDATE
+      livePrice,    // Live price for TRADES_UPDATE
       timestamp: Date.now()
     });
 

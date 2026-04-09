@@ -1,0 +1,92 @@
+#cloud-config
+# Oracle Cloud Instance Setup with K3s, Docker, and ArgoCD
+# Automated GitOps Pipeline for XAU/USD Platform
+
+chpasswd:
+  list: |
+    ubuntu:OracleCloud2024!
+  expire: False
+
+ssh_pwauth: True
+
+packages:
+  - python3
+  - python3-pip
+  - git
+  - tmux
+  - htop
+  - curl
+  - wget
+  - iptables-persistent
+  - netfilter-persistent
+  - make
+  - jq
+
+runcmd:
+  # Fix Oracle Cloud Virtual Cloud Network Firewalls
+  - iptables -I INPUT -p tcp --dport 22 -j ACCEPT
+  - iptables -I INPUT -p tcp --dport 80 -j ACCEPT
+  - iptables -I INPUT -p tcp --dport 443 -j ACCEPT
+  - iptables -I INPUT -p tcp --dport 3000 -j ACCEPT
+  - iptables -I INPUT -p tcp --dport 30000 -j ACCEPT
+  - iptables -I INPUT -p tcp --dport 30443 -j ACCEPT
+  - netfilter-persistent save
+  - ufw disable
+
+  # Install Tailscale for Secure Access
+  - curl -fsSL https://tailscale.com/install.sh | sh
+  - systemctl enable tailscaled
+  - systemctl start tailscaled
+
+  # Install Docker (Required to build the containers)
+  - curl -fsSL https://get.docker.com | sh
+  - systemctl enable docker
+  - systemctl start docker
+  - usermod -aG docker ubuntu
+
+  # Install K3s (Configured to use the host's Docker daemon)
+  - curl -sfL https://get.k3s.io | sh -s - --docker
+  - export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+  - echo "export KUBECONFIG=/etc/rancher/k3s/k3s.yaml" >> /home/ubuntu/.bashrc
+
+  # Clone the Git Repository
+  - cd /home/ubuntu
+  - git clone https://github.com/thaisonnguyenbt2/exness.git exness
+  - chown -R ubuntu:ubuntu exness
+
+  # Build all Docker microservices locally
+  - cd /home/ubuntu/exness
+  - make build-all
+
+  # Install ArgoCD into the k3s cluster
+  - KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl create namespace argocd
+  - KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl apply -n argocd --server-side -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+  
+  # Expose ArgoCD Dashboard via NodePort 30443 (Because Oracle doesn't provision native Cloud LoadBalancers naturally for small instances)
+  - KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl patch svc argocd-server -n argocd -p '{"spec":{"type":"NodePort","ports":[{"port":80,"targetPort":8080,"nodePort":30080},{"port":443,"targetPort":8080,"nodePort":30443}]}}'
+
+  # Wait 10 seconds for ArgoCD CRDs to settle
+  - sleep 10
+
+  # Apply the local ArgoCD application which instantly begins syncing our manifests
+  - KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl apply -f k8s/local/argocd-app-local.yaml
+  
+  # Wait 20 seconds for ArgoCD to boot the Frontend Service and expose it cleanly!
+  - sleep 20
+  - KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl patch svc frontend -n exness-trading -p '{"spec":{"type":"NodePort","ports":[{"port":80,"targetPort":3000,"nodePort":30000}]}}'
+
+final_message: |
+  ==============================================================
+  🚀 Oracle Cloud Cluster Bootstrap Complete!
+  ==============================================================
+
+  Ubuntu User Password: OracleCloud2024!
+
+  Next Steps:
+  1. SSH into the box: ssh ubuntu@<public_ip>
+  2. Bring up Tailscale: sudo tailscale up
+  3. ArgoCD Dashboard: https://<instance_ip>:30443 (admin / zKFkdSZJg6vsg8AL)
+  4. Trading Dashboard: http://<instance_ip>:30000
+  
+  Notes: You must modify '/home/ubuntu/exness/k8s/base/config.yaml' and insert your API keys inside the instance!
+  ==============================================================

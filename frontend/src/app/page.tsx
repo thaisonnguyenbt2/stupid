@@ -66,11 +66,9 @@ export default function Dashboard() {
     }
   }, []);
 
-  // Polling fallback
+  // Initial fetch on mount
   useEffect(() => {
     fetchTrades();
-    const interval = setInterval(fetchTrades, 3000);
-    return () => clearInterval(interval);
   }, [fetchTrades]);
 
   // WebSocket: Live ticks
@@ -107,8 +105,21 @@ export default function Dashboard() {
         ws.onmessage = (ev) => {
           try {
             const event = JSON.parse(ev.data);
-            setNotifications(prev => [event, ...prev].slice(0, 5));
-            fetchTrades(); // Refresh on trade events
+            if (event.type === 'TRADES_UPDATE') {
+              if (event.trades) setTrades(event.trades);
+              if (event.livePrice) setLivePrice(event.livePrice);
+              if (event.indicators) setIndicators(event.indicators);
+            } else {
+              setNotifications(prev => [event, ...prev].slice(0, 5));
+              // Play alert sound for actual notifications
+              try {
+                const audio = new Audio('https://actions.google.com/sounds/v1/ui/message_notification.ogg');
+                audio.volume = 0.6;
+                audio.play().catch(() => {});
+              } catch {}
+              // We don't need to fetchTrades() here anymore because TRADES_UPDATE comes 
+              // at the same time and handles the state update efficiently.
+            }
           } catch {}
         };
         ws.onclose = () => setTimeout(connect, 5000);
@@ -266,6 +277,112 @@ export default function Dashboard() {
         <IndicatorCard label="M5 RSI" value={indicators.m5_rsi} warn={indicators.m5_rsi !== undefined && (indicators.m5_rsi > 70 || indicators.m5_rsi < 30)} />
         <IndicatorCard label="M5 ATR" value={indicators.m5_atr} />
       </div>
+
+      {/* Trend Analysis Summary */}
+      {(() => {
+        const { m5_ema9, m5_ema21, m5_ema50, m5_rsi, m5_atr, m1_rsi, m1_upper_bb, m1_lower_bb } = indicators;
+        const price = livePrice;
+        if (!price || !m5_ema9 || !m5_ema21 || !m5_ema50 || m5_rsi === undefined || m1_rsi === undefined) return null;
+
+        // Determine trend direction from M5 EMA alignment
+        const emaBull = m5_ema9 > m5_ema21 && m5_ema21 > m5_ema50;
+        const emaBear = m5_ema9 < m5_ema21 && m5_ema21 < m5_ema50;
+        const priceAboveEma = price > m5_ema9 && price > m5_ema21;
+        const priceBelowEma = price < m5_ema9 && price < m5_ema21;
+
+        // Confidence scoring
+        let bullScore = 0;
+        let bearScore = 0;
+
+        if (emaBull) bullScore += 2;
+        if (emaBear) bearScore += 2;
+        if (priceAboveEma) bullScore += 1;
+        if (priceBelowEma) bearScore += 1;
+        if (m5_rsi > 55) bullScore += 1;
+        if (m5_rsi < 45) bearScore += 1;
+        if (m5_rsi > 65) bullScore += 1;
+        if (m5_rsi < 35) bearScore += 1;
+        if (m1_rsi > 60) bullScore += 1;
+        if (m1_rsi < 40) bearScore += 1;
+        if (m1_upper_bb && price > m1_upper_bb) bullScore += 1;
+        if (m1_lower_bb && price < m1_lower_bb) bearScore += 1;
+
+        const netScore = bullScore - bearScore;
+        let direction = 'NEUTRAL';
+        let emoji = '⚖️';
+        let color = '#94a3b8';
+        let bgColor = 'rgba(148,163,184,0.08)';
+        let borderColor = 'rgba(148,163,184,0.2)';
+        let confidence = 'Low';
+        let detail = '';
+
+        if (netScore >= 4) {
+          direction = 'STRONG BULLISH'; emoji = '🟢🔥'; color = '#34d399'; confidence = 'High';
+          bgColor = 'rgba(52,211,153,0.08)'; borderColor = 'rgba(52,211,153,0.25)';
+          detail = `Price is running above all M5 EMAs with strong RSI momentum. The M5 trend is fully aligned bullish (EMA9 > EMA21 > EMA50). Look for pullback entries on dips toward EMA21.`;
+        } else if (netScore >= 2) {
+          direction = 'BULLISH'; emoji = '🟢'; color = '#34d399'; confidence = 'Moderate';
+          bgColor = 'rgba(52,211,153,0.06)'; borderColor = 'rgba(52,211,153,0.18)';
+          detail = `M5 structure is leaning bullish. EMAs are starting to fan upward and price is holding above key moving averages. Watch for pullback-to-EMA entries on the long side.`;
+        } else if (netScore <= -4) {
+          direction = 'STRONG BEARISH'; emoji = '🔴🔥'; color = '#f87171'; confidence = 'High';
+          bgColor = 'rgba(248,113,113,0.08)'; borderColor = 'rgba(248,113,113,0.25)';
+          detail = `Price is trading below all M5 EMAs with falling RSI. The M5 trend is fully aligned bearish (EMA9 < EMA21 < EMA50). Look for short entries on rallies into EMA21 resistance.`;
+        } else if (netScore <= -2) {
+          direction = 'BEARISH'; emoji = '🔴'; color = '#f87171'; confidence = 'Moderate';
+          bgColor = 'rgba(248,113,113,0.06)'; borderColor = 'rgba(248,113,113,0.18)';
+          detail = `M5 structure is leaning bearish. EMAs are compressing or fanning downward. Favor short setups and be cautious with longs.`;
+        } else {
+          direction = 'NEUTRAL / RANGING'; emoji = '⚖️'; color = '#94a3b8'; confidence = 'Low';
+          detail = `No clear directional bias detected. The M5 EMAs are flat or mixed, and RSI is hovering near midline. This is a choppy / consolidation zone — mean reversion (BB) strategies are favored over trend-following entries.`;
+        }
+
+        // Recent trade activity summary
+        const recentOpen = trades.filter(t => t.status === 'OPEN');
+        const recentLongs = recentOpen.filter(t => t.direction === 'LONG').length;
+        const recentShorts = recentOpen.filter(t => t.direction === 'SHORT').length;
+
+        return (
+          <div style={{
+            background: bgColor,
+            border: `1px solid ${borderColor}`,
+            borderRadius: 'var(--radius-lg)',
+            padding: '18px 24px',
+            marginBottom: 20,
+            transition: 'all 0.3s ease'
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 8 }}>
+              <span style={{ fontSize: 22 }}>{emoji}</span>
+              <span style={{ fontSize: 17, fontWeight: 800, color }}>
+                {direction}
+              </span>
+              <span style={{
+                fontSize: 11, fontWeight: 600, padding: '3px 10px',
+                borderRadius: 6, background: `${color}22`, color,
+                border: `1px solid ${color}44`
+              }}>
+                {confidence} Confidence
+              </span>
+              {recentOpen.length > 0 && (
+                <span style={{ fontSize: 11, color: 'var(--text-muted)', marginLeft: 'auto' }}>
+                  Open positions: {recentLongs > 0 ? `${recentLongs} Long` : ''}{recentLongs > 0 && recentShorts > 0 ? ' · ' : ''}{recentShorts > 0 ? `${recentShorts} Short` : ''}
+                </span>
+              )}
+            </div>
+            <p style={{ color: 'var(--text-secondary)', fontSize: 13, lineHeight: 1.5, margin: 0 }}>
+              {detail}
+            </p>
+            <div style={{
+              display: 'flex', gap: 16, marginTop: 10, fontSize: 11, color: 'var(--text-muted)'
+            }}>
+              <span>M5 RSI: <b style={{ color: m5_rsi > 65 ? '#34d399' : m5_rsi < 35 ? '#f87171' : 'var(--text-secondary)' }}>{m5_rsi.toFixed(1)}</b></span>
+              <span>M1 RSI: <b style={{ color: m1_rsi > 65 ? '#34d399' : m1_rsi < 35 ? '#f87171' : 'var(--text-secondary)' }}>{m1_rsi.toFixed(1)}</b></span>
+              <span>EMA Spread: <b style={{ color: 'var(--text-secondary)' }}>{(m5_ema9 - m5_ema50).toFixed(2)}</b></span>
+              {m5_atr !== undefined && <span>ATR: <b style={{ color: 'var(--text-secondary)' }}>{m5_atr.toFixed(2)}</b></span>}
+            </div>
+          </div>
+        );
+      })()}
 
       {/* Trade Ledger */}
       <div style={{

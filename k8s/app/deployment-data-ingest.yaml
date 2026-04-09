@@ -1,0 +1,22 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: data-ingest
+  namespace: trading-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: data-ingest
+  template:
+    metadata:
+      labels:
+        app: data-ingest
+    spec:
+      containers:
+      - name: data-ingest
+        image: trading-data-ingest:latest
+        imagePullPolicy: Never
+        envFrom:
+        - secretRef:
+            name: trading-secrets
