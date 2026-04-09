@@ -41,6 +41,10 @@ export async function startFinnhubStream(
   const wsUrl = `wss://ws.finnhub.io?token=${apiKey}`;
   console.log(`[Finnhub] Connecting to WebSocket for ${symbol}...`);
 
+  // Track reconnect attempts for exponential backoff (prevents infinite loops)
+  const MAX_RECONNECT_ATTEMPTS = 20;
+  let reconnectAttempts = 0;
+
   const ws = new WebSocket(wsUrl);
   let currentCandle: LiveCandle | null = null;
   let lastSaveTime = 0;
@@ -59,14 +63,21 @@ export async function startFinnhubStream(
     isReconnecting = true;
     cleanup();
     try { ws.terminate(); } catch {}
-    console.log('[Finnhub] Reconnecting in 5s...');
-    setTimeout(() => startFinnhubStream(symbol, onTrade), 5000);
+    reconnectAttempts++;
+    if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
+      console.error(`[Finnhub] ❌ Max reconnect attempts (${MAX_RECONNECT_ATTEMPTS}) reached. Giving up.`);
+      return;
+    }
+    const delay = Math.min(5000 * Math.pow(1.5, reconnectAttempts - 1), 60000); // 5s → 60s max
+    console.log(`[Finnhub] Reconnecting in ${(delay/1000).toFixed(0)}s... (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
+    setTimeout(() => startFinnhubStream(symbol, onTrade), delay);
   }
 
   ws.on('open', () => {
     console.log('[Finnhub] Connected. Subscribing...');
     ws.send(JSON.stringify({ type: 'subscribe', symbol }));
     lastDataTime = Date.now();
+    reconnectAttempts = 0; // Reset on successful connection
 
     // Ping every 15s to keep connection alive through NAT/proxies
     pingTimer = setInterval(() => {
@@ -117,9 +128,12 @@ export async function startFinnhubStream(
       }
 
       // Floor timestamp to M1 bucket (Date object for MongoDB consistency)
-      const tradeMs = latestTrade.t; // Unix ms from Finnhub
+      // NOTE: Finnhub provides Unix ms timestamps (latestTrade.t) which are inherently UTC.
+      // This is consistent with our MongoDB storage. TwelveData uses string timestamps
+      // that we parse with 'Z' suffix — both approaches produce UTC Date objects.
+      const tradeMs = latestTrade.t; // Unix ms from Finnhub (UTC)
       const bucketMs = Math.floor(tradeMs / 60000) * 60000;
-      const bucketDate = new Date(bucketMs);
+      const bucketDate = new Date(bucketMs); // UTC Date
 
       if (!currentCandle || currentCandle.timestamp.getTime() !== bucketDate.getTime()) {
         // Save the previous candle as final
@@ -165,8 +179,8 @@ export async function startFinnhubStream(
           `[Finnhub] M1 Live → Close: ${price.toFixed(3)} | Ticks: ${currentCandle.tickVolume}`
         );
       }
-    } catch (err) {
-      console.error('[Finnhub] Parse/DB error:', err);
+    } catch (err: any) {
+      console.error('[Finnhub] ⚠️ Parse/DB error:', err?.message || err);
     }
   });
 

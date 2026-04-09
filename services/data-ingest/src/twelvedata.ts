@@ -48,7 +48,8 @@ export async function bootstrapHistoricalData(symbol: string, hours: number): Pr
 
     let count = 0;
     for (const item of data.values) {
-      // TwelveData format: "2026-04-08 16:30:00" — parse as UTC
+      // TwelveData format: "2026-04-08 16:30:00" — parse as UTC by appending 'Z'
+      // This ensures consistency with Finnhub's Unix ms timestamps — both produce UTC Date objects.
       const timestampDate = new Date(`${item.datetime.replace(' ', 'T')}Z`);
       if (isNaN(timestampDate.getTime())) continue;
 

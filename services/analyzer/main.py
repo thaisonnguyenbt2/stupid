@@ -76,17 +76,34 @@ def calc_atr(df, period=14):
 
 # ===================== NOTIFICATION HELPER =====================
 
+notify_fail_count = 0
+
 def notify(type_: str, title: str, message: str, trade: dict = None):
     """Send notification to the notification service."""
+    global notify_fail_count
     try:
         payload = {'type': type_, 'title': title, 'message': message}
         if trade:
             # Sanitize MongoDB ObjectId — not JSON serializable
             clean = {k: str(v) if k == '_id' else v for k, v in trade.items()}
             payload['trade'] = clean
-        requests.post(NOTIFICATION_URL, json=payload, timeout=5)
+        resp = requests.post(NOTIFICATION_URL, json=payload, timeout=5)
+        if resp.status_code != 200:
+            notify_fail_count += 1
+            print(f"[Notify] ⚠️ HTTP {resp.status_code}: {resp.text[:100]} (fail #{notify_fail_count})")
+        else:
+            if notify_fail_count > 0:
+                print(f"[Notify] ✅ Recovered after {notify_fail_count} failures")
+            notify_fail_count = 0
+    except requests.exceptions.ConnectionError:
+        notify_fail_count += 1
+        print(f"[Notify] ❌ Connection refused to {NOTIFICATION_URL} (fail #{notify_fail_count})")
+    except requests.exceptions.Timeout:
+        notify_fail_count += 1
+        print(f"[Notify] ❌ Timeout after 5s (fail #{notify_fail_count})")
     except Exception as e:
-        print(f"[Notify Error] {e}")
+        notify_fail_count += 1
+        print(f"[Notify] ❌ {type(e).__name__}: {e} (fail #{notify_fail_count})")
 
 
 # ===================== DATA LOADING =====================
@@ -551,10 +568,6 @@ def monitor_trades(db):
                 close_reason = 'STOP_LOSS'
 
         if close_reason:
-            pnl_raw = abs(live_price - entry) if close_reason == 'TAKE_PROFIT' else -abs(live_price - entry)
-            if direction == 'SHORT':
-                pnl_raw = -pnl_raw if close_reason == 'TAKE_PROFIT' else abs(pnl_raw)
-                pnl_raw = abs(entry - live_price) if close_reason == 'TAKE_PROFIT' else -abs(entry - live_price)
 
             # Correct PnL
             if direction == 'LONG':
