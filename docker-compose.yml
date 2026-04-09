@@ -8,6 +8,69 @@ services:
       - "27017:27017"
     volumes:
       - mongo-data:/data/db
+    networks:
+      - trading-net
+
+  data-ingest:
+    build:
+      context: ./services/data-ingest
+    container_name: xau-data-ingest
+    ports:
+      - "4000:4000"
+    env_file:
+      - .env
+    environment:
+      - MONGODB_URI=mongodb://trading-db:27017/trading
+    depends_on:
+      - trading-db
+    networks:
+      - trading-net
+
+  analyzer:
+    build:
+      context: ./services/analyzer
+    container_name: xau-analyzer
+    ports:
+      - "4002:4002"
+    env_file:
+      - .env
+    environment:
+      - MONGODB_URI=mongodb://trading-db:27017/trading
+      - NOTIFICATION_URL=http://notification:4003/api/notify
+    depends_on:
+      - trading-db
+      - notification
+    networks:
+      - trading-net
+
+  notification:
+    build:
+      context: ./services/notification
+    container_name: xau-notification
+    ports:
+      - "4003:4003"
+    env_file:
+      - .env
+    networks:
+      - trading-net
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: xau-frontend
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    depends_on:
+      - data-ingest
+      - analyzer
+    networks:
+      - trading-net
 
 volumes:
   mongo-data:
+
+networks:
+  trading-net:
+    driver: bridge

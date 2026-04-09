@@ -44,13 +44,49 @@ export async function startFinnhubStream(
   const ws = new WebSocket(wsUrl);
   let currentCandle: LiveCandle | null = null;
   let lastSaveTime = 0;
+  let lastDataTime = Date.now();
+  let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  let pingTimer: ReturnType<typeof setInterval> | null = null;
+  let isReconnecting = false;
+
+  function cleanup() {
+    if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+    if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
+  }
+
+  function reconnect() {
+    if (isReconnecting) return;
+    isReconnecting = true;
+    cleanup();
+    try { ws.terminate(); } catch {}
+    console.log('[Finnhub] Reconnecting in 5s...');
+    setTimeout(() => startFinnhubStream(symbol, onTrade), 5000);
+  }
 
   ws.on('open', () => {
     console.log('[Finnhub] Connected. Subscribing...');
     ws.send(JSON.stringify({ type: 'subscribe', symbol }));
+    lastDataTime = Date.now();
+
+    // Ping every 15s to keep connection alive through NAT/proxies
+    pingTimer = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.ping();
+      }
+    }, 15000);
+
+    // Check for stale connection every 10s — force reconnect if no data for 30s
+    heartbeatTimer = setInterval(() => {
+      const silenceSecs = (Date.now() - lastDataTime) / 1000;
+      if (silenceSecs > 30) {
+        console.warn(`[Finnhub] No data for ${silenceSecs.toFixed(0)}s — connection is zombie. Forcing reconnect...`);
+        reconnect();
+      }
+    }, 10000);
   });
 
   ws.on('message', async (rawData: any) => {
+    lastDataTime = Date.now();
     try {
       const payloadStr = rawData.toString('utf-8');
       onTrade(payloadStr); // Broadcast raw to WS clients (frontend)
@@ -139,7 +175,7 @@ export async function startFinnhubStream(
   });
 
   ws.on('close', () => {
-    console.log('[Finnhub] Connection closed. Reconnecting in 5s...');
-    setTimeout(() => startFinnhubStream(symbol, onTrade), 5000);
+    console.log('[Finnhub] Connection closed.');
+    reconnect();
   });
 }

@@ -32,6 +32,21 @@
         }
         .ds-btn:hover:not(.active) { background: rgba(99, 102, 241, 0.1); color: #a5b4fc; border-color: #4f46e5; }
 
+        /* Timeframe Selector */
+        .tf-selector { display: flex; gap: 4px; margin-left: 12px; }
+        .tf-btn {
+            padding: 6px 14px; border: 1px solid #2d3561; background: transparent;
+            color: #64748b; font-size: 11px; font-weight: 600; font-family: 'Inter', sans-serif;
+            cursor: pointer; transition: all 0.2s; letter-spacing: 0.5px;
+        }
+        .tf-btn:first-child { border-radius: 6px 0 0 6px; }
+        .tf-btn:last-child { border-radius: 0 6px 6px 0; }
+        .tf-btn.active {
+            background: linear-gradient(135deg, #10b981, #059669); color: #fff;
+            border-color: #10b981; box-shadow: 0 0 12px rgba(16, 185, 129, 0.3);
+        }
+        .tf-btn:hover:not(.active) { background: rgba(16, 185, 129, 0.1); color: #6ee7b7; border-color: #059669; }
+
         .stats { display: flex; gap: 20px; flex-wrap: wrap; }
         .stat-box { display: flex; flex-direction: column; align-items: flex-end; }
         .stat-label { font-size: 9px; text-transform: uppercase; color: #64748b; letter-spacing: 1px; margin-bottom: 1px; }
@@ -153,6 +168,11 @@
             <button class="ds-btn" onclick="switchDataset('202602')" id="btn-202602">Feb 2026</button>
             <button class="ds-btn" onclick="switchDataset('202603')" id="btn-202603">Mar 2026</button>
         </div>
+        <div class="tf-selector">
+            <button class="tf-btn active" onclick="switchTimeframe(1)" id="tf-1">M1</button>
+            <button class="tf-btn" onclick="switchTimeframe(5)" id="tf-5">M5</button>
+            <button class="tf-btn" onclick="switchTimeframe(15)" id="tf-15">M15</button>
+        </div>
     </div>
     <div class="stats" id="stats-container"></div>
 </div>
@@ -196,6 +216,8 @@
     let candleSeries = null;
     let chart = null;
     let currentDataset = '202601';
+    let currentTimeframe = 1;
+    let rawM1Candles = [];
     let markerToTradeMap = {};
 
     function togglePanel() {
@@ -325,6 +347,34 @@
         `;
     }
 
+    function aggregateCandles(m1, minutes) {
+        if (minutes === 1) return m1;
+        const bucketSecs = minutes * 60;
+        const map = new Map();
+        for (const c of m1) {
+            const bucket = Math.floor(c.time / bucketSecs) * bucketSecs;
+            if (!map.has(bucket)) {
+                map.set(bucket, { time: bucket, open: c.open, high: c.high, low: c.low, close: c.close });
+            } else {
+                const b = map.get(bucket);
+                b.high = Math.max(b.high, c.high);
+                b.low = Math.min(b.low, c.low);
+                b.close = c.close;
+            }
+        }
+        return Array.from(map.values()).sort((a, b) => a.time - b.time);
+    }
+
+    function switchTimeframe(tf) {
+        if (tf === currentTimeframe && chart) return;
+        currentTimeframe = tf;
+        document.querySelectorAll('.tf-btn').forEach(b => b.classList.remove('active'));
+        document.getElementById(`tf-${tf}`).classList.add('active');
+        if (rawM1Candles.length > 0) {
+            rebuildChart();
+        }
+    }
+
     async function switchDataset(dsId) {
         if (dsId === currentDataset && chart) return;
         currentDataset = dsId;
@@ -364,7 +414,7 @@
                 throw new Error(`Dataset ${dsId} not found. Run: python dry_run_xau.py ${dsId}`);
             }
 
-            const candles = await candlesRes.json();
+            rawM1Candles = await candlesRes.json();
             allTrades = await tradesRes.json();
 
             // Stats
@@ -396,95 +446,122 @@
                 ${stratHtml}
             `;
 
-            // Chart
-            chart = LightweightCharts.createChart(document.getElementById('chart'), {
-                layout: { background: { type: 'solid', color: '#0a0e1a' }, textColor: '#64748b' },
-                grid: { vertLines: { color: '#141830' }, horzLines: { color: '#141830' } },
-                timeScale: { timeVisible: true, secondsVisible: false, borderColor: '#1f2937' },
-                rightPriceScale: { borderColor: '#1f2937' },
-                crosshair: { mode: LightweightCharts.CrosshairMode.Normal }
-            });
-
-            candleSeries = chart.addCandlestickSeries({
-                upColor: '#10b981', downColor: '#ef4444',
-                borderVisible: false,
-                wickUpColor: '#10b981', wickDownColor: '#ef4444'
-            });
-            candleSeries.setData(candles);
-
-            // Build markers
-            const markers = [];
-            const usedTimes = new Set();
-            markerToTradeMap = {};
-
-            allTrades.forEach((t, idx) => {
-                let t_entry = t.time;
-                while (usedTimes.has(t_entry)) { t_entry += 1; }
-                usedTimes.add(t_entry);
-                markerToTradeMap[t_entry] = idx;
-
-                markers.push({
-                    time: t_entry,
-                    position: t.dir === 'LONG' ? 'belowBar' : 'aboveBar',
-                    color: t.dir === 'LONG' ? '#34d399' : '#f87171',
-                    shape: t.dir === 'LONG' ? 'arrowUp' : 'arrowDown',
-                    text: `${t.strat}`,
-                });
-
-                if (t.status.startsWith('CLOSED')) {
-                    let t_exit = t.exit_time;
-                    while (usedTimes.has(t_exit)) { t_exit += 1; }
-                    usedTimes.add(t_exit);
-                    markerToTradeMap[t_exit] = idx;
-
-                    const isWin = t.pnl > 0;
-                    markers.push({
-                        time: t_exit,
-                        position: t.dir === 'LONG' ? (isWin ? 'aboveBar' : 'belowBar') : (isWin ? 'belowBar' : 'aboveBar'),
-                        color: isWin ? '#38bdf8' : '#fbbf24',
-                        shape: 'circle',
-                        text: `${isWin ? 'TP' : 'SL'} $${t.pnl.toFixed(2)}`,
-                    });
-                }
-            });
-
-            markers.sort((a, b) => a.time - b.time);
-            candleSeries.setMarkers(markers);
-
-            // Click handler
-            chart.subscribeClick(param => {
-                if (!param || !param.time) return;
-                let closestIdx = -1, closestDist = Infinity;
-                for (const [mTime, tIdx] of Object.entries(markerToTradeMap)) {
-                    const dist = Math.abs(Number(mTime) - param.time);
-                    if (dist < closestDist) { closestDist = dist; closestIdx = tIdx; }
-                }
-                if (closestIdx >= 0 && closestDist <= 300) {
-                    showTradeDetail(allTrades[closestIdx], closestIdx);
-                }
-            });
-
-            chart.subscribeCrosshairMove(param => {
-                if (!param || !param.time) return;
-                let closestIdx = -1, closestDist = Infinity;
-                for (const [mTime, tIdx] of Object.entries(markerToTradeMap)) {
-                    const dist = Math.abs(Number(mTime) - param.time);
-                    if (dist < closestDist) { closestDist = dist; closestIdx = tIdx; }
-                }
-                if (closestIdx >= 0 && closestDist <= 60) {
-                    showTradeDetail(allTrades[closestIdx], closestIdx);
-                }
-            });
-
-            window.addEventListener('resize', () => {
-                if (chart) chart.resize(document.getElementById('chart-wrapper').clientWidth, document.getElementById('chart-wrapper').clientHeight);
-            });
+            rebuildChart();
 
         } catch (err) {
             console.error("Error:", err);
             document.getElementById('stats-container').innerHTML = `<div style="color:#f87171;font-size:13px;">Error: ${err.message}</div>`;
             document.getElementById('loading-overlay').classList.add('hidden');
         }
+    }
+
+    function rebuildChart() {
+        // Destroy existing chart
+        if (chart) {
+            chart.remove();
+            chart = null;
+            candleSeries = null;
+            activeLineSeries = [];
+        }
+        selectedTradeIdx = -1;
+
+        const candles = aggregateCandles(rawM1Candles, currentTimeframe);
+        const bucketSecs = currentTimeframe * 60;
+
+        // Build a set of valid candle times for snapping markers
+        const candleTimeSet = new Set(candles.map(c => c.time));
+
+        chart = LightweightCharts.createChart(document.getElementById('chart'), {
+            layout: { background: { type: 'solid', color: '#0a0e1a' }, textColor: '#64748b' },
+            grid: { vertLines: { color: '#141830' }, horzLines: { color: '#141830' } },
+            timeScale: { timeVisible: true, secondsVisible: false, borderColor: '#1f2937' },
+            rightPriceScale: { borderColor: '#1f2937' },
+            crosshair: { mode: LightweightCharts.CrosshairMode.Normal }
+        });
+
+        candleSeries = chart.addCandlestickSeries({
+            upColor: '#10b981', downColor: '#ef4444',
+            borderVisible: false,
+            wickUpColor: '#10b981', wickDownColor: '#ef4444'
+        });
+        candleSeries.setData(candles);
+
+        // Build markers — snap trade times to the nearest candle bucket
+        const markers = [];
+        const usedTimes = new Set();
+        markerToTradeMap = {};
+
+        function snapToCandle(unixTime) {
+            return Math.floor(unixTime / bucketSecs) * bucketSecs;
+        }
+
+        allTrades.forEach((t, idx) => {
+            let t_entry = snapToCandle(t.time);
+            while (usedTimes.has(t_entry)) { t_entry += 1; }
+            usedTimes.add(t_entry);
+            markerToTradeMap[t_entry] = idx;
+
+            markers.push({
+                time: t_entry,
+                position: t.dir === 'LONG' ? 'belowBar' : 'aboveBar',
+                color: t.dir === 'LONG' ? '#34d399' : '#f87171',
+                shape: t.dir === 'LONG' ? 'arrowUp' : 'arrowDown',
+                text: `${t.strat}`,
+            });
+
+            if (t.status.startsWith('CLOSED')) {
+                let t_exit = snapToCandle(t.exit_time);
+                while (usedTimes.has(t_exit)) { t_exit += 1; }
+                usedTimes.add(t_exit);
+                markerToTradeMap[t_exit] = idx;
+
+                const isWin = t.pnl > 0;
+                markers.push({
+                    time: t_exit,
+                    position: t.dir === 'LONG' ? (isWin ? 'aboveBar' : 'belowBar') : (isWin ? 'belowBar' : 'aboveBar'),
+                    color: isWin ? '#38bdf8' : '#fbbf24',
+                    shape: 'circle',
+                    text: `${isWin ? 'TP' : 'SL'} $${t.pnl.toFixed(2)}`,
+                });
+            }
+        });
+
+        markers.sort((a, b) => a.time - b.time);
+        candleSeries.setMarkers(markers);
+
+        // Click / hover tolerance scales with timeframe
+        const clickTolerance = bucketSecs * 5;
+        const hoverTolerance = bucketSecs;
+
+        chart.subscribeClick(param => {
+            if (!param || !param.time) return;
+            let closestIdx = -1, closestDist = Infinity;
+            for (const [mTime, tIdx] of Object.entries(markerToTradeMap)) {
+                const dist = Math.abs(Number(mTime) - param.time);
+                if (dist < closestDist) { closestDist = dist; closestIdx = tIdx; }
+            }
+            if (closestIdx >= 0 && closestDist <= clickTolerance) {
+                showTradeDetail(allTrades[closestIdx], closestIdx);
+            }
+        });
+
+        chart.subscribeCrosshairMove(param => {
+            if (!param || !param.time) return;
+            let closestIdx = -1, closestDist = Infinity;
+            for (const [mTime, tIdx] of Object.entries(markerToTradeMap)) {
+                const dist = Math.abs(Number(mTime) - param.time);
+                if (dist < closestDist) { closestDist = dist; closestIdx = tIdx; }
+            }
+            if (closestIdx >= 0 && closestDist <= hoverTolerance) {
+                showTradeDetail(allTrades[closestIdx], closestIdx);
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            if (chart) chart.resize(document.getElementById('chart-wrapper').clientWidth, document.getElementById('chart-wrapper').clientHeight);
+        });
+
+        document.getElementById('loading-overlay').classList.add('hidden');
     }
 
     // Load default dataset

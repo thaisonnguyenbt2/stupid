@@ -38,7 +38,7 @@ load_dotenv(os.path.join(os.path.dirname(__file__), '..', '..', '.env'))
 MONGO_URI = os.getenv('MONGODB_URI', 'mongodb://localhost:27017/trading')
 SYMBOL = os.getenv('SYMBOL', 'OANDA:XAU_USD')
 ANALYZER_PORT = int(os.getenv('ANALYZER_PORT', '4002'))
-NOTIFICATION_URL = f"http://localhost:{os.getenv('NOTIFICATION_PORT', '4003')}/api/notify"
+NOTIFICATION_URL = os.getenv('NOTIFICATION_URL', f"http://localhost:{os.getenv('NOTIFICATION_PORT', '4003')}/api/notify")
 
 LOT_SIZE = 0.01
 CONTRACT_SIZE = 100  # 1 lot = 100 oz
@@ -81,7 +81,9 @@ def notify(type_: str, title: str, message: str, trade: dict = None):
     try:
         payload = {'type': type_, 'title': title, 'message': message}
         if trade:
-            payload['trade'] = trade
+            # Sanitize MongoDB ObjectId — not JSON serializable
+            clean = {k: str(v) if k == '_id' else v for k, v in trade.items()}
+            payload['trade'] = clean
         requests.post(NOTIFICATION_URL, json=payload, timeout=5)
     except Exception as e:
         print(f"[Notify Error] {e}")
@@ -173,8 +175,17 @@ def format_trade_message(action, direction, price, strategy, meta):
 
 
 def run_strategies(db):
-    """Execute all 3 strategies against latest data. Called every 5s."""
+    """Execute all 3 strategies with two-stage PREPARE → OPEN flow. Called every 5s."""
     global last_ema_time, last_bb_time, last_inst_time
+
+    # Expire old PREPARE signals (15 min TTL)
+    cutoff = int((time.time() - 900) * 1000)
+    expired = db.paper_trades.update_many(
+        {'status': 'PREPARE', 'entryTime': {'$lt': cutoff}},
+        {'$set': {'status': 'EXPIRED', 'closeReason': 'PREPARE_TIMEOUT'}}
+    )
+    if expired.modified_count > 0:
+        print(f"[Prepare] Expired {expired.modified_count} stale PREPARE signal(s)")
 
     df_m1 = load_candles(db, SYMBOL, 500)
     if df_m1 is None or len(df_m1) < 50:
@@ -239,126 +250,220 @@ def run_strategies(db):
     now = time.time()
     live_price = get_live_price(db) or m1_close
 
+    def find_prepare(signal_type):
+        return db.paper_trades.find_one({'signalType': signal_type, 'status': 'PREPARE', 'symbol': SYMBOL})
+
+    def promote(prepare_doc, meta_new):
+        direction = prepare_doc['direction']
+        signal_type = prepare_doc['signalType']
+        tp_dist = abs(prepare_doc['tp'] - prepare_doc['entryPrice'])
+        sl_dist = abs(prepare_doc['sl'] - prepare_doc['entryPrice'])
+        new_tp = live_price + tp_dist if direction == 'LONG' else live_price - tp_dist
+        new_sl = live_price - sl_dist if direction == 'LONG' else live_price + sl_dist
+        db.paper_trades.update_one(
+            {'_id': prepare_doc['_id']},
+            {'$set': {
+                'status': 'OPEN', 'entryPrice': round(live_price, 3),
+                'tp': round(new_tp, 3), 'sl': round(new_sl, 3),
+                'entryTime': int(now * 1000), 'meta': meta_new, 'promotedFrom': 'PREPARE',
+            }}
+        )
+        msg = format_trade_message('ORDER LIVE 🔥', direction, live_price, signal_type, meta_new)
+        notify('TRADE_OPEN', f"🔥 {signal_type} {direction} — NOW LIVE", msg)
+        print(f"[Promote] {signal_type} {direction} PREPARE → OPEN at {live_price:.3f}")
+
+    def create_prepare(signal_type, direction, tp, sl, meta):
+        trade_doc = {
+            'symbol': SYMBOL, 'direction': direction, 'status': 'PREPARE',
+            'entryPrice': round(live_price, 3), 'tp': round(tp, 3), 'sl': round(sl, 3),
+            'entryTime': int(now * 1000),
+            'signalType': signal_type, 'meta': meta, 'lotSize': LOT_SIZE,
+        }
+        db.paper_trades.insert_one(trade_doc)
+        msg = format_trade_message('⏳ PREPARE', direction, live_price, signal_type, meta)
+        notify('TRADE_PREPARE', f"⏳ {signal_type} {direction} — Conditions forming", msg, trade_doc)
+        print(f"[Prepare] {signal_type} {direction} at {live_price:.3f} — watching for entry")
+
     # ==================== STRATEGY A: EMA Trend Pullback ====================
     if now - last_ema_time > COOLDOWN_SECS:
         m5_bull = m5_ema9 > m5_ema21 > m5_ema50
         m5_bear = m5_ema9 < m5_ema21 < m5_ema50
 
-        direction = None
+        # --- FULL conditions (OPEN) ---
+        full_dir = None
         if m5_bull and m1_low <= m1_ema21 and m1_rsi <= 45:
-            direction = 'LONG'
+            full_dir = 'LONG'
         elif m5_bear and m1_high >= m1_ema21 and m1_rsi >= 55:
-            direction = 'SHORT'
+            full_dir = 'SHORT'
 
-        if direction:
+        if full_dir:
             last_ema_time = now
             tp_dist = m5_atr * 3.0
             sl_dist = m5_atr * 1.2
-            tp = live_price + tp_dist if direction == 'LONG' else live_price - tp_dist
-            sl = live_price - sl_dist if direction == 'LONG' else live_price + sl_dist
-
+            tp = live_price + tp_dist if full_dir == 'LONG' else live_price - tp_dist
+            sl = live_price - sl_dist if full_dir == 'LONG' else live_price + sl_dist
             meta = {
                 'rule': f"M5 EMA {'9>21>50 BULL' if m5_bull else '9<21<50 BEAR'}, M1 pullback to EMA21, M1 RSI reset",
-                'm1_rsi': round(m1_rsi, 2),
-                'm1_ema21': round(m1_ema21, 3),
-                'm5_ema9': round(m5_ema9, 3),
-                'm5_ema21': round(m5_ema21, 3),
-                'm5_ema50': round(m5_ema50, 3),
-                'm5_atr': round(m5_atr, 3),
+                'm1_rsi': round(m1_rsi, 2), 'm1_ema21': round(m1_ema21, 3),
+                'm5_ema9': round(m5_ema9, 3), 'm5_ema21': round(m5_ema21, 3),
+                'm5_ema50': round(m5_ema50, 3), 'm5_atr': round(m5_atr, 3),
                 'tp_mult': 3.0, 'sl_mult': 1.2,
             }
+            prep = find_prepare('EMA_PULLBACK')
+            if prep:
+                promote(prep, meta)
+            else:
+                trade_doc = {
+                    'symbol': SYMBOL, 'direction': full_dir, 'status': 'OPEN',
+                    'entryPrice': round(live_price, 3), 'tp': round(tp, 3), 'sl': round(sl, 3),
+                    'entryTime': int(now * 1000),
+                    'signalType': 'EMA_PULLBACK', 'meta': meta, 'lotSize': LOT_SIZE,
+                }
+                db.paper_trades.insert_one(trade_doc)
+                msg = format_trade_message('NEW ORDER', full_dir, live_price, 'EMA_PULLBACK', meta)
+                notify('TRADE_OPEN', f"📐 EMA Pullback {full_dir}", msg, trade_doc)
+                print(f"[Strategy A] {full_dir} at {live_price:.3f} | TP: {tp:.3f} | SL: {sl:.3f}")
+        else:
+            # --- PREPARE: EMA aligned but price approaching pullback zone ---
+            prep_dir = None
+            if m5_bull and m1_close <= m1_ema21 + m5_atr * 1.5 and m1_rsi <= 55:
+                prep_dir = 'LONG'
+            elif m5_bear and m1_close >= m1_ema21 - m5_atr * 1.5 and m1_rsi >= 45:
+                prep_dir = 'SHORT'
 
-            trade_doc = {
-                'symbol': SYMBOL, 'direction': direction, 'status': 'OPEN',
-                'entryPrice': round(live_price, 3), 'tp': round(tp, 3), 'sl': round(sl, 3),
-                'entryTime': int(now * 1000),
-                'signalType': 'EMA_PULLBACK', 'meta': meta, 'lotSize': LOT_SIZE,
-            }
-            db.paper_trades.insert_one(trade_doc)
-
-            msg = format_trade_message('NEW ORDER', direction, live_price, 'EMA_PULLBACK', meta)
-            notify('TRADE_OPEN', f"📐 EMA Pullback {direction}", msg, trade_doc)
-            print(f"[Strategy A] {direction} at {live_price:.3f} | TP: {tp:.3f} | SL: {sl:.3f}")
+            if prep_dir and not find_prepare('EMA_PULLBACK'):
+                tp_dist = m5_atr * 3.0
+                sl_dist = m5_atr * 1.2
+                tp = live_price + tp_dist if prep_dir == 'LONG' else live_price - tp_dist
+                sl = live_price - sl_dist if prep_dir == 'LONG' else live_price + sl_dist
+                dist = abs(m1_close - m1_ema21)
+                meta = {
+                    'rule': f"M5 EMA {'9>21>50 BULL' if m5_bull else '9<21<50 BEAR'} ✓, Price ${dist:.2f} from EMA21, RSI {m1_rsi:.1f} approaching zone",
+                    'm1_rsi': round(m1_rsi, 2), 'm1_ema21': round(m1_ema21, 3),
+                    'm1_close': round(m1_close, 3), 'dist_to_trigger': round(dist, 3),
+                    'm5_ema9': round(m5_ema9, 3), 'm5_ema21': round(m5_ema21, 3),
+                    'm5_ema50': round(m5_ema50, 3), 'm5_atr': round(m5_atr, 3),
+                    'tp_mult': 3.0, 'sl_mult': 1.2,
+                }
+                create_prepare('EMA_PULLBACK', prep_dir, tp, sl, meta)
 
     # ==================== STRATEGY B: Bollinger Mean Reversion ====================
     if now - last_bb_time > COOLDOWN_SECS:
-        direction = None
+        full_dir = None
         bb_trigger = ''
-
         if m1_high > m1_upper_bb and m1_rsi >= 75:
-            direction = 'SHORT'
+            full_dir = 'SHORT'
             bb_trigger = f"M1 High ({m1_high:.3f}) > Upper BB ({m1_upper_bb:.3f}), RSI {m1_rsi:.1f} >= 75"
         elif m1_low < m1_lower_bb and m1_rsi <= 25:
-            direction = 'LONG'
+            full_dir = 'LONG'
             bb_trigger = f"M1 Low ({m1_low:.3f}) < Lower BB ({m1_lower_bb:.3f}), RSI {m1_rsi:.1f} <= 25"
 
-        if direction:
+        if full_dir:
             last_bb_time = now
             tp_dist = m5_atr * 2.0
             sl_dist = m5_atr * 1.5
-            tp = live_price + tp_dist if direction == 'LONG' else live_price - tp_dist
-            sl = live_price - sl_dist if direction == 'LONG' else live_price + sl_dist
-
+            tp = live_price + tp_dist if full_dir == 'LONG' else live_price - tp_dist
+            sl = live_price - sl_dist if full_dir == 'LONG' else live_price + sl_dist
             meta = {
-                'rule': bb_trigger,
-                'm1_rsi': round(m1_rsi, 2),
-                'm1_upper_bb': round(m1_upper_bb, 3),
-                'm1_lower_bb': round(m1_lower_bb, 3),
-                'm5_atr': round(m5_atr, 3),
-                'tp_mult': 2.0, 'sl_mult': 1.5,
+                'rule': bb_trigger, 'm1_rsi': round(m1_rsi, 2),
+                'm1_upper_bb': round(m1_upper_bb, 3), 'm1_lower_bb': round(m1_lower_bb, 3),
+                'm5_atr': round(m5_atr, 3), 'tp_mult': 2.0, 'sl_mult': 1.5,
             }
+            prep = find_prepare('BB_REVERSION')
+            if prep:
+                promote(prep, meta)
+            else:
+                trade_doc = {
+                    'symbol': SYMBOL, 'direction': full_dir, 'status': 'OPEN',
+                    'entryPrice': round(live_price, 3), 'tp': round(tp, 3), 'sl': round(sl, 3),
+                    'entryTime': int(now * 1000),
+                    'signalType': 'BB_REVERSION', 'meta': meta, 'lotSize': LOT_SIZE,
+                }
+                db.paper_trades.insert_one(trade_doc)
+                msg = format_trade_message('NEW ORDER', full_dir, live_price, 'BB_REVERSION', meta)
+                notify('TRADE_OPEN', f"📊 BB Reversion {full_dir}", msg, trade_doc)
+                print(f"[Strategy B] {full_dir} at {live_price:.3f} | TP: {tp:.3f} | SL: {sl:.3f}")
+        else:
+            # --- PREPARE: price near BB, RSI approaching extreme ---
+            prep_dir = None
+            bb_prep = ''
+            if m1_high > m1_upper_bb - m5_atr * 0.5 and m1_rsi >= 65:
+                prep_dir = 'SHORT'
+                bb_prep = f"Price near Upper BB (within {m5_atr*0.5:.2f}), RSI {m1_rsi:.1f} → 75"
+            elif m1_low < m1_lower_bb + m5_atr * 0.5 and m1_rsi <= 35:
+                prep_dir = 'LONG'
+                bb_prep = f"Price near Lower BB (within {m5_atr*0.5:.2f}), RSI {m1_rsi:.1f} → 25"
 
-            trade_doc = {
-                'symbol': SYMBOL, 'direction': direction, 'status': 'OPEN',
-                'entryPrice': round(live_price, 3), 'tp': round(tp, 3), 'sl': round(sl, 3),
-                'entryTime': int(now * 1000),
-                'signalType': 'BB_REVERSION', 'meta': meta, 'lotSize': LOT_SIZE,
-            }
-            db.paper_trades.insert_one(trade_doc)
-
-            msg = format_trade_message('NEW ORDER', direction, live_price, 'BB_REVERSION', meta)
-            notify('TRADE_OPEN', f"📊 BB Reversion {direction}", msg, trade_doc)
-            print(f"[Strategy B] {direction} at {live_price:.3f} | TP: {tp:.3f} | SL: {sl:.3f}")
+            if prep_dir and not find_prepare('BB_REVERSION'):
+                tp_dist = m5_atr * 2.0
+                sl_dist = m5_atr * 1.5
+                tp = live_price + tp_dist if prep_dir == 'LONG' else live_price - tp_dist
+                sl = live_price - sl_dist if prep_dir == 'LONG' else live_price + sl_dist
+                meta = {
+                    'rule': bb_prep, 'm1_rsi': round(m1_rsi, 2),
+                    'm1_upper_bb': round(m1_upper_bb, 3), 'm1_lower_bb': round(m1_lower_bb, 3),
+                    'm5_atr': round(m5_atr, 3), 'tp_mult': 2.0, 'sl_mult': 1.5,
+                }
+                create_prepare('BB_REVERSION', prep_dir, tp, sl, meta)
 
     # ==================== STRATEGY C: Institutional Breakout ====================
     if now - last_inst_time > COOLDOWN_SECS:
         vol_ratio = (m5_vol / m5_vol_sma) if m5_vol_sma > 0 else 0
 
-        direction = None
+        full_dir = None
         if vol_ratio > 2.0:
             if m5_close > m5_upper_bb and m1_low <= m5_ema9:
-                direction = 'LONG'
+                full_dir = 'LONG'
             elif m5_close < m5_lower_bb and m1_high >= m5_ema9:
-                direction = 'SHORT'
+                full_dir = 'SHORT'
 
-        if direction:
+        if full_dir:
             last_inst_time = now
             tp_dist = m5_atr * 4.0
             sl_dist = m5_atr * 1.0
-            tp = live_price + tp_dist if direction == 'LONG' else live_price - tp_dist
-            sl = live_price - sl_dist if direction == 'LONG' else live_price + sl_dist
-
+            tp = live_price + tp_dist if full_dir == 'LONG' else live_price - tp_dist
+            sl = live_price - sl_dist if full_dir == 'LONG' else live_price + sl_dist
             meta = {
-                'rule': f"M5 Vol surge ({vol_ratio:.1f}x > 2.0x), M5 close {'above Upper BB' if direction == 'LONG' else 'below Lower BB'}, M1 pullback to M5 EMA9",
-                'm5_volume': round(m5_vol, 0),
-                'm5_vol_ratio': round(vol_ratio, 2),
-                'm5_close': round(m5_close, 3),
-                'm5_ema9': round(m5_ema9, 3),
-                'm5_atr': round(m5_atr, 3),
-                'tp_mult': 4.0, 'sl_mult': 1.0,
+                'rule': f"M5 Vol surge ({vol_ratio:.1f}x > 2.0x), M5 close {'above Upper BB' if full_dir == 'LONG' else 'below Lower BB'}, M1 pullback to M5 EMA9",
+                'm5_volume': round(m5_vol, 0), 'm5_vol_ratio': round(vol_ratio, 2),
+                'm5_close': round(m5_close, 3), 'm5_ema9': round(m5_ema9, 3),
+                'm5_atr': round(m5_atr, 3), 'tp_mult': 4.0, 'sl_mult': 1.0,
             }
+            prep = find_prepare('INST_BREAKOUT')
+            if prep:
+                promote(prep, meta)
+            else:
+                trade_doc = {
+                    'symbol': SYMBOL, 'direction': full_dir, 'status': 'OPEN',
+                    'entryPrice': round(live_price, 3), 'tp': round(tp, 3), 'sl': round(sl, 3),
+                    'entryTime': int(now * 1000),
+                    'signalType': 'INST_BREAKOUT', 'meta': meta, 'lotSize': LOT_SIZE,
+                }
+                db.paper_trades.insert_one(trade_doc)
+                msg = format_trade_message('NEW ORDER', full_dir, live_price, 'INST_BREAKOUT', meta)
+                notify('TRADE_OPEN', f"🏦 Inst. Breakout {full_dir}", msg, trade_doc)
+                print(f"[Strategy C] {full_dir} at {live_price:.3f} | TP: {tp:.3f} | SL: {sl:.3f}")
+        else:
+            # --- PREPARE: volume building, price approaching BB ---
+            prep_dir = None
+            if vol_ratio > 1.5:
+                if m5_close > m5_upper_bb - m5_atr * 0.5:
+                    prep_dir = 'LONG'
+                elif m5_close < m5_lower_bb + m5_atr * 0.5:
+                    prep_dir = 'SHORT'
 
-            trade_doc = {
-                'symbol': SYMBOL, 'direction': direction, 'status': 'OPEN',
-                'entryPrice': round(live_price, 3), 'tp': round(tp, 3), 'sl': round(sl, 3),
-                'entryTime': int(now * 1000),
-                'signalType': 'INST_BREAKOUT', 'meta': meta, 'lotSize': LOT_SIZE,
-            }
-            db.paper_trades.insert_one(trade_doc)
-
-            msg = format_trade_message('NEW ORDER', direction, live_price, 'INST_BREAKOUT', meta)
-            notify('TRADE_OPEN', f"🏦 Inst. Breakout {direction}", msg, trade_doc)
-            print(f"[Strategy C] {direction} at {live_price:.3f} | TP: {tp:.3f} | SL: {sl:.3f}")
+            if prep_dir and not find_prepare('INST_BREAKOUT'):
+                tp_dist = m5_atr * 4.0
+                sl_dist = m5_atr * 1.0
+                tp = live_price + tp_dist if prep_dir == 'LONG' else live_price - tp_dist
+                sl = live_price - sl_dist if prep_dir == 'LONG' else live_price + sl_dist
+                meta = {
+                    'rule': f"M5 Vol building ({vol_ratio:.1f}x → 2.0x), M5 close approaching {'Upper BB' if prep_dir == 'LONG' else 'Lower BB'}",
+                    'm5_volume': round(m5_vol, 0), 'm5_vol_ratio': round(vol_ratio, 2),
+                    'm5_close': round(m5_close, 3), 'm5_ema9': round(m5_ema9, 3),
+                    'm5_atr': round(m5_atr, 3), 'tp_mult': 4.0, 'sl_mult': 1.0,
+                }
+                create_prepare('INST_BREAKOUT', prep_dir, tp, sl, meta)
 
 
 # ===================== TP/SL MONITOR =====================

@@ -128,7 +128,8 @@ export default function Dashboard() {
 
   const totalPnL = trades.reduce((sum, t) => {
     if (t.status === 'CLOSED') return sum + (t.pnl || 0);
-    return sum + (getUnrealized(t) || 0);
+    if (t.status === 'OPEN') return sum + (getUnrealized(t) || 0);
+    return sum;
   }, 0);
 
   const closedTrades = trades.filter(t => t.status === 'CLOSED');
@@ -136,6 +137,7 @@ export default function Dashboard() {
   const losses = closedTrades.filter(t => (t.pnl || 0) < 0).length;
   const winRate = closedTrades.length > 0 ? ((wins / closedTrades.length) * 100).toFixed(1) : '0.0';
   const openCount = trades.filter(t => t.status === 'OPEN').length;
+  const prepareCount = trades.filter(t => t.status === 'PREPARE').length;
 
   const handleDelete = async (id: string) => {
     if (!confirm('Delete this trade?')) return;
@@ -230,6 +232,7 @@ export default function Dashboard() {
           <StatCard label="Win Rate" value={`${winRate}%`} color="var(--accent-blue)" />
           <StatCard label="W / L" value={`${wins} / ${losses}`} color="var(--accent-purple)" />
           <StatCard label="Open" value={`${openCount}`} color="var(--accent-yellow)" />
+          <StatCard label="Prepare" value={`${prepareCount}`} color="var(--accent-purple)" />
         </div>
       </div>
 
@@ -288,6 +291,7 @@ export default function Dashboard() {
                 <th style={{ padding: '12px 16px', textAlign: 'left' }}>Strategy</th>
                 <th style={{ padding: '12px 16px', textAlign: 'right' }}>Entry</th>
                 <th style={{ padding: '12px 16px', textAlign: 'right' }}>Exit / Live</th>
+                <th style={{ padding: '12px 16px', textAlign: 'center' }}>Peak / Low</th>
                 <th style={{ padding: '12px 16px', textAlign: 'center' }}>TP / SL</th>
                 <th style={{ padding: '12px 16px', textAlign: 'center' }}>Duration</th>
                 <th style={{ padding: '12px 16px', textAlign: 'center' }}>Status</th>
@@ -298,7 +302,7 @@ export default function Dashboard() {
             <tbody>
               {trades.length === 0 && !loading && (
                 <tr>
-                  <td colSpan={11} style={{ padding: '40px 20px', textAlign: 'center', color: 'var(--text-dim)', fontStyle: 'italic' }}>
+                  <td colSpan={12} style={{ padding: '40px 20px', textAlign: 'center', color: 'var(--text-dim)', fontStyle: 'italic' }}>
                     Waiting for trading signals...
                   </td>
                 </tr>
@@ -364,6 +368,18 @@ export default function Dashboard() {
                           <span style={{ color: 'var(--text-secondary)', fontFamily: 'monospace' }}>${trade.exitPrice.toFixed(2)}</span>
                         ) : '--'}
                       </td>
+                      <td style={{ padding: '12px 16px', textAlign: 'center', fontSize: 11, fontFamily: 'monospace', color: 'var(--text-muted)' }}>
+                        {trade.peakProfit !== undefined && trade.peakLoss !== undefined ? (
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                            <span style={{ color: 'var(--accent-green)' }}>
+                              +${trade.peakProfit.toFixed(2)}
+                            </span>
+                            <span style={{ color: 'var(--accent-red)' }}>
+                              -${Math.abs(trade.peakLoss).toFixed(2)}
+                            </span>
+                          </div>
+                        ) : '--'}
+                      </td>
                       <td style={{ padding: '12px 16px', textAlign: 'center', fontSize: 11 }}>
                         {trade.tp && trade.sl ? (
                           <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
@@ -376,7 +392,11 @@ export default function Dashboard() {
                         {formatDuration(trade.entryTime, trade.exitTime)}
                       </td>
                       <td style={{ padding: '12px 16px', textAlign: 'center' }}>
-                        {trade.status === 'OPEN' ? (
+                        {trade.status === 'PREPARE' ? (
+                          <span style={{ color: 'var(--accent-yellow)', fontSize: 11, fontWeight: 700 }} className="animate-pulse">⏳ PREPARE</span>
+                        ) : trade.status === 'EXPIRED' ? (
+                          <span style={{ color: 'var(--text-dim)', fontSize: 11, fontWeight: 600 }}>⌛ EXPIRED</span>
+                        ) : trade.status === 'OPEN' ? (
                           <span style={{ color: 'var(--accent-blue)', fontSize: 11, fontWeight: 700 }}>● LIVE</span>
                         ) : trade.closeReason === 'TAKE_PROFIT' ? (
                           <span style={{ color: 'var(--accent-green)', fontSize: 11, fontWeight: 600 }}>✅ TP</span>
@@ -415,7 +435,7 @@ export default function Dashboard() {
                     {/* Meta row: show strategy conditions */}
                     {trade.meta && trade.meta.rule && (
                       <tr>
-                        <td colSpan={11} style={{
+                        <td colSpan={12} style={{
                           padding: '4px 16px 12px 46px', fontSize: 11, color: 'var(--text-secondary)',
                           fontStyle: 'italic', borderBottom: '1px solid rgba(51,65,85,0.3)'
                         }}>

@@ -32,7 +32,7 @@ All of the following must be true simultaneously on the same M1 candle:
 |---|-----------|----------------|
 | 1 | M5 EMA alignment is bullish | `m5_ema9 > m5_ema21 > m5_ema50` |
 | 2 | M1 candle low touches or pierces the M1 EMA21 | `m1_low <= m1_ema21` |
-| 3 | M1 RSI(14) is at or below 45 (pullback exhaustion) | `m1_rsi <= 45` |
+| 3 | M1 RSI(14) is at or belolasw 45 (pullback exhaustion) | `m1_rsi <= 45` |
 | 4 | Cooldown elapsed since last EMA_PULLBACK entry | `time - last_ema_t > 10min` |
 | 5 | M5 ATR is alive | `m5_atr >= 0.05` |
 

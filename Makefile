@@ -1,4 +1,4 @@
-.PHONY: dev dev-frontend dev-ingest dev-analyzer dev-notification install clean-ghosts
+.PHONY: dev dev-frontend dev-ingest dev-analyzer dev-notification install clean-ghosts chart
 
 clean-ghosts:
 	@echo "Killing ghost processes..."
@@ -12,6 +12,8 @@ clean-ghosts:
 	@lsof -ti:4003 | xargs kill -9 2>/dev/null || true
 
 dev: clean-ghosts
+	@echo "Starting MongoDB container..."
+	@docker compose up -d trading-db
 	@echo "Starting XAU/USD Paper Trading Platform..."
 	@make -j4 dev-frontend dev-ingest dev-analyzer dev-notification
 
@@ -39,7 +41,36 @@ install:
 	cd services/analyzer && python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt
 
 db-up:
-	docker compose up -d
+	docker compose up -d --build
 
 db-down:
 	docker compose down
+
+# ===================== DRY RUN / BACKTEST =====================
+
+# Run against a specific CSV file:
+#   make dry-run FILE=data/DAT_ASCII_XAUUSD_T_202603.csv
+#
+# Run against a JSON candles file:
+#   make dry-run FILE=data/chart_candles_202603.json
+#
+# Run all available datasets:
+#   make dry-run-all
+
+dry-run:
+ifndef FILE
+	@echo "Usage: make dry-run FILE=data/DAT_ASCII_XAUUSD_T_202603.csv"
+	@exit 1
+endif
+	@echo "[Dry Run] Running analyzer backtest against $(FILE)..."
+	bash -c 'cd services/analyzer && source venv/bin/activate && python dry_run.py "../../$(FILE)"'
+
+dry-run-all:
+	@echo "[Dry Run] Running analyzer backtest against ALL datasets..."
+	bash -c 'cd services/analyzer && source venv/bin/activate && python dry_run.py all'
+
+chart:
+	@echo "[Chart] Serving Dry Run Visualization at http://localhost:8000"
+	@lsof -ti:8000 | xargs kill -9 2>/dev/null || true
+	python3 data/serve_ui.py
+
