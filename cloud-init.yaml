@@ -1,6 +1,7 @@
 #cloud-config
-# Oracle Cloud Instance Setup with K3s, Docker, and ArgoCD
-# Automated GitOps Pipeline for XAU/USD Platform
+# Oracle Cloud Instance Setup — Lightweight Docker Compose Deployment
+# For VM.Standard.E2.1.Micro (1 OCPU / 1GB RAM)
+# Auto-deploys via git-pull cron (replaces K3s + ArgoCD)
 
 chpasswd:
   list: |
@@ -23,13 +24,13 @@ packages:
   - jq
 
 runcmd:
-  # Fix Oracle Cloud Virtual Cloud Network Firewalls
+  # Fix Oracle Cloud VCN Firewalls
   - iptables -I INPUT -p tcp --dport 22 -j ACCEPT
   - iptables -I INPUT -p tcp --dport 80 -j ACCEPT
   - iptables -I INPUT -p tcp --dport 443 -j ACCEPT
-  - iptables -I INPUT -p tcp --dport 3000 -j ACCEPT
-  - iptables -I INPUT -p tcp --dport 30000 -j ACCEPT
-  - iptables -I INPUT -p tcp --dport 30443 -j ACCEPT
+  - iptables -I INPUT -p tcp --dport 4000 -j ACCEPT
+  - iptables -I INPUT -p tcp --dport 4002 -j ACCEPT
+  - iptables -I INPUT -p tcp --dport 4003 -j ACCEPT
   - netfilter-persistent save
   - ufw disable
 
@@ -38,55 +39,82 @@ runcmd:
   - systemctl enable tailscaled
   - systemctl start tailscaled
 
-  # Install Docker (Required to build the containers)
+  # Install Docker + Docker Compose
   - curl -fsSL https://get.docker.com | sh
   - systemctl enable docker
   - systemctl start docker
   - usermod -aG docker ubuntu
 
-  # Install K3s (Configured to use the host's Docker daemon)
-  - curl -sfL https://get.k3s.io | sh -s - --docker
-  - export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-  - echo "export KUBECONFIG=/etc/rancher/k3s/k3s.yaml" >> /home/ubuntu/.bashrc
+  # Create swap (helps on 1GB RAM)
+  - fallocate -l 512M /swapfile
+  - chmod 600 /swapfile
+  - mkswap /swapfile
+  - swapon /swapfile
+  - echo '/swapfile none swap sw 0 0' >> /etc/fstab
 
   # Clone the Git Repository
   - cd /home/ubuntu
-  - git clone https://github.com/thaisonnguyenbt2/exness.git exness
-  - chown -R ubuntu:ubuntu exness
+  - git clone https://github.com/thaisonnguyenbt2/exness.git trading
+  - chown -R ubuntu:ubuntu trading
 
-  # Build all Docker microservices locally
-  - cd /home/ubuntu/exness
-  - make build-all
+  # Copy .env with production secrets (must be edited after first boot)
+  - cp /home/ubuntu/trading/.env.example /home/ubuntu/trading/.env 2>/dev/null || true
 
-  # Install ArgoCD into the k3s cluster
-  - KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl create namespace argocd
-  - KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl apply -n argocd --server-side -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
-  
-  # Expose ArgoCD Dashboard via NodePort 30443 (Because Oracle doesn't provision native Cloud LoadBalancers naturally for small instances)
-  - KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl patch svc argocd-server -n argocd -p '{"spec":{"type":"NodePort","ports":[{"port":80,"targetPort":8080,"nodePort":30080},{"port":443,"targetPort":8080,"nodePort":30443}]}}'
+  # Build and start all services
+  - cd /home/ubuntu/trading
+  - docker compose -f docker-compose.prod.yml up -d --build
 
-  # Wait 10 seconds for ArgoCD CRDs to settle
-  - sleep 10
+  # Setup auto-deploy systemd timer (every 5 minutes)
+  - chmod +x /home/ubuntu/trading/scripts/auto-deploy.sh
+  - |
+    cat > /etc/systemd/system/auto-deploy.service << 'EOF'
+    [Unit]
+    Description=XAU/USD Trading Platform Auto-Deploy
+    After=docker.service
 
-  # Apply the local ArgoCD application which instantly begins syncing our manifests
-  - KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl apply -f k8s/local/argocd-app-local.yaml
-  
-  # Wait 20 seconds for ArgoCD to boot the Frontend Service and expose it cleanly!
-  - sleep 20
-  - KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl patch svc frontend -n exness-trading -p '{"spec":{"type":"NodePort","ports":[{"port":80,"targetPort":3000,"nodePort":30000}]}}'
+    [Service]
+    Type=oneshot
+    ExecStart=/home/ubuntu/trading/scripts/auto-deploy.sh
+    User=ubuntu
+    WorkingDirectory=/home/ubuntu/trading
+    EOF
+  - |
+    cat > /etc/systemd/system/auto-deploy.timer << 'EOF'
+    [Unit]
+    Description=Auto-deploy every 5 minutes
+
+    [Timer]
+    OnBootSec=120
+    OnUnitActiveSec=300
+    Persistent=true
+
+    [Install]
+    WantedBy=timers.target
+    EOF
+  - systemctl daemon-reload
+  - systemctl enable auto-deploy.timer
+  - systemctl start auto-deploy.timer
 
 final_message: |
   ==============================================================
-  🚀 Oracle Cloud Cluster Bootstrap Complete!
+  🚀 Oracle Cloud Trading Platform — Bootstrap Complete!
   ==============================================================
 
   Ubuntu User Password: OracleCloud2024!
+  Architecture: Docker Compose (no K3s — lightweight for 1GB RAM)
 
   Next Steps:
   1. SSH into the box: ssh ubuntu@<public_ip>
-  2. Bring up Tailscale: sudo tailscale up
-  3. ArgoCD Dashboard: https://<instance_ip>:30443 (admin / zKFkdSZJg6vsg8AL)
-  4. Trading Dashboard: http://<instance_ip>:30000
-  
-  Notes: You must modify '/home/ubuntu/exness/k8s/base/config.yaml' and insert your API keys inside the instance!
+  2. Edit .env with your API keys: nano /home/ubuntu/trading/.env
+  3. Restart services: cd /home/ubuntu/trading && docker compose -f docker-compose.prod.yml restart
+  4. Bring up Tailscale: sudo tailscale up
+
+  Services:
+    - Data Ingest:  http://<instance_ip>:4000
+    - Analyzer API:  http://<instance_ip>:4002
+    - Notifications: http://<instance_ip>:4003
+
+  Auto-Deploy: Every 5 minutes via systemd timer
+    - Logs: /var/log/auto-deploy.log
+    - Status: systemctl status auto-deploy.timer
   ==============================================================

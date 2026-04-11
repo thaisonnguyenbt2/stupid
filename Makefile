@@ -52,27 +52,45 @@ db-down:
 	docker compose down
 
 # ===================== DRY RUN / BACKTEST =====================
-
-# Run against a specific CSV file:
-#   make dry-run FILE=data/DAT_ASCII_XAUUSD_T_202603.csv
 #
-# Run against a JSON candles file:
-#   make dry-run FILE=data/chart_candles_202603.json
+# All dry-run commands use the SAME strategy.py as the live analyzer.
+# This guarantees parity between backtest and production.
+#
+# Run against a specific dataset (202601, 202602, 202603):
+#   make dry-run DS=202603
+#
+# Run against a specific CSV file:
+#   make dry-run DS=data/DAT_ASCII_XAUUSD_T_202603.csv
 #
 # Run all available datasets:
 #   make dry-run-all
+#
+# Compare with/without trend filter:
+#   make dry-run-compare
+#
+# Run against MongoDB paper trading data:
+#   make dry-run-mongo
 
 dry-run:
-ifndef FILE
-	@echo "Usage: make dry-run FILE=data/DAT_ASCII_XAUUSD_T_202603.csv"
+ifndef DS
+	@echo "Usage: make dry-run DS=202603"
+	@echo "       make dry-run DS=data/DAT_ASCII_XAUUSD_T_202603.csv"
 	@exit 1
 endif
-	@echo "[Dry Run] Running analyzer backtest against $(FILE)..."
-	bash -c 'cd services/analyzer && source venv/bin/activate && python dry_run.py "../../$(FILE)"'
+	@echo "[Dry Run] Running backtest against $(DS)..."
+	bash -c 'cd services/analyzer && source venv/bin/activate && python dry_run.py --csv "$(DS)"'
 
 dry-run-all:
-	@echo "[Dry Run] Running analyzer backtest against ALL datasets..."
-	bash -c 'cd data && source ../services/analyzer/venv/bin/activate && python dry_run_xau.py all'
+	@echo "[Dry Run] Running backtest against ALL datasets..."
+	bash -c 'cd services/analyzer && source venv/bin/activate && python dry_run.py --csv all'
+
+dry-run-compare:
+	@echo "[Dry Run] Comparing WITH vs WITHOUT trend filter..."
+	bash -c 'cd services/analyzer && source venv/bin/activate && python dry_run.py --csv compare'
+
+dry-run-mongo:
+	@echo "[Dry Run] Running backtest against MongoDB paper trading data..."
+	bash -c 'cd services/analyzer && source venv/bin/activate && python dry_run.py --mongo'
 
 chart:
 	@echo "[Chart] Serving Dry Run Visualization at http://localhost:8000"
@@ -92,11 +110,27 @@ k8s-deploy: k8s-build
 	@echo "Deploying newly built images to local cluster..."
 	kubectl rollout restart deployment frontend analyzer data-ingest notification -n trading-system
 
+# ===================== DOCKER COMPOSE PRODUCTION =====================
+
+prod-up:
+	@echo "Starting production stack (Docker Compose)..."
+	docker compose -f docker-compose.prod.yml up -d --build
+
+prod-down:
+	@echo "Stopping production stack..."
+	docker compose -f docker-compose.prod.yml down
+
+prod-logs:
+	docker compose -f docker-compose.prod.yml logs -f --tail=50
+
+prod-status:
+	docker compose -f docker-compose.prod.yml ps
+
 # ===================== ORACLE CLOUD (OCI) =====================
 
 ocl-login:
-	@echo "Authenticating with Oracle Cloud..."
-	oci session authenticate || oci setup config
+	@echo "Testing OCI API key auth..."
+	@oci iam user get --user-id $(shell grep '^user' ~/.oci/config | head -1 | cut -d= -f2 | tr -d ' ') --query 'data.name' --raw-output && echo "✅ OCI auth working" || echo "❌ OCI auth failed — run 'oci setup config'"
 
 ocl-provision:
 	@echo "Launching Oracle Cloud Instance with cloud-init.yaml payload..."
@@ -106,11 +140,21 @@ ocl-provision:
 		--image-id $(OCL_IMAGE_ID) \
 		--availability-domain $(OCL_AVAILABILITY_DOMAIN) \
 		--shape $(OCL_SHAPE) \
-		--shape-config '{"Ocpus": $(OCL_OCPUS), "MemoryInGBs": $(OCL_MEMORY)}' \
 		--assign-public-ip true \
-		--display-name "trading-k3s-node" \
+		--display-name "trading-docker-node" \
 		--user-data-file cloud-init.yaml
 
 ocl-provision-auto:
 	@echo "Starting Oracle Capacity Auto-Retrier..."
 	@bash scripts/oci-retry.sh
+
+ocl-setup:
+ifndef IP
+	$(error Usage: make ocl-setup IP=<vm_public_ip>)
+endif
+	@echo "📦 Uploading .env to VM $(IP)..."
+	scp -o StrictHostKeyChecking=no .env ubuntu@$(IP):/home/ubuntu/trading/.env
+	@echo "🔄 Restarting services on VM..."
+	ssh -o StrictHostKeyChecking=no ubuntu@$(IP) "cd /home/ubuntu/trading && docker compose -f docker-compose.prod.yml restart"
+	@echo "✅ Done! Services running with production secrets."
+	@echo "   View logs: ssh ubuntu@$(IP) 'cd /home/ubuntu/trading && docker compose -f docker-compose.prod.yml logs -f'"

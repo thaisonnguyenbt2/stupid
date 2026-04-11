@@ -1,321 +1,268 @@
 """
-Dry-run backtest module for the Analyzer service.
-=================================================
-Reuses the EXACT same indicator and strategy logic from main.py
-against historical CSV tick data or pre-cached JSON files.
+XAU/USD Unified Dry-Run / Backtest
+===================================
+Replays the EXACT strategy logic from strategy.py against historical data.
 
-Usage:
-  python dry_run.py ../../data/DAT_ASCII_XAUUSD_T_202603.csv
-  python dry_run.py ../../data/chart_candles_202603.json
-  python dry_run.py all      # run all CSVs in ../../data/
+Data sources:
+  --csv FILE      Run against historical tick CSV (e.g. DAT_ASCII_XAUUSD_T_202603.csv)
+  --csv all       Run against all available CSV datasets
+  --csv compare   Run with/without trend filter comparison
+  --mongo         Run against M1 candles in MongoDB (paper trading data)
 
-Outputs:
-  dryrun_candles_<id>.json   — M1 OHLC for chart visualization
-  dryrun_trades_<id>.json    — executed trades with metadata
-
-These JSON files are in the SAME format as /data/chart_*.json,
-so you can load them in /data/index.html for visual verification.
+Uses the identical evaluate_strategies() function as the live analyzer,
+guaranteeing parity between backtest and production.
 """
 
 import os
 import sys
 import time
 import json
+import argparse
+
 import numpy as np
 import pandas as pd
+from dotenv import load_dotenv
 
-# Reuse indicator functions from main.py (same directory)
-from main import calc_ema, calc_rsi, calc_atr
+# Import the single source of truth
+from strategy import (
+    attach_indicators, resample_m5, evaluate_strategies,
+    MarketSnapshot, CooldownState, POSITION_OZ, COOLDOWN_SECS,
+)
+
+load_dotenv(os.path.join(os.path.dirname(__file__), '..', '..', '.env'))
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'data')
-OUTPUT_DIR = DATA_DIR  # Write JSON next to the existing chart files
-
-# ----- Exness 0.01 lot sizing -----
-LOT_SIZE = 0.01
-CONTRACT_SIZE = 100  # 1 lot = 100 oz
-POSITION_OZ = LOT_SIZE * CONTRACT_SIZE  # 1.0 oz
-
-COOLDOWN = pd.Timedelta(minutes=10)
 
 
 # ===================== DATA LOADING =====================
 
-def load_csv_ticks(csv_path):
-    """Load and resample DAT_ASCII tick CSV to M1 and M5 DataFrames."""
-    print(f"[DryRun] Reading tick data from {csv_path}...")
-    start = time.time()
+def load_from_csv(csv_path):
+    """Load tick-level CSV, resample to M1/M5, cache as pickle."""
+    dataset_id = None
+    for tag in ['202601', '202602', '202603']:
+        if tag in csv_path:
+            dataset_id = tag
+            break
+    if dataset_id is None:
+        dataset_id = os.path.splitext(os.path.basename(csv_path))[0]
 
-    df_tick = pd.read_csv(csv_path, header=None, names=['time_str', 'bid', 'ask', 'volume'])
-    df_tick['time_str'] = df_tick['time_str'] + '000'
-    df_tick['time'] = pd.to_datetime(df_tick['time_str'], format='%Y%m%d %H%M%S%f')
-    df_tick['price'] = (df_tick['bid'] + df_tick['ask']) / 2.0
-    df_tick.set_index('time', inplace=True)
-    df_tick.sort_index(inplace=True)
-
-    print(f"[DryRun] Parsed {len(df_tick)} ticks in {time.time() - start:.1f}s. Resampling...")
-
-    def agg_tf(freq):
-        df_agg = df_tick.resample(freq).agg({
-            'price': ['first', 'max', 'min', 'last'],
-            'volume': 'sum'
-        })
-        df_agg.columns = ['open', 'high', 'low', 'close', 'volume']
-        df_agg.dropna(inplace=True)
-        # Tick volume: count ticks per candle
-        tick_vol = df_tick.resample(freq)['price'].count()
-        df_agg['tickVolume'] = tick_vol.reindex(df_agg.index).fillna(0)
-        # Use tickVolume as the volume proxy (raw volume is often 0)
-        df_agg['volume'] = df_agg['tickVolume'].where(df_agg['tickVolume'] > 0, df_agg['volume']).replace(0, 1)
-        return df_agg
-
-    df_m1 = agg_tf('1min')
-    df_m5 = agg_tf('5min')
-
-    return df_m1, df_m5
-
-
-def load_json_candles(json_path):
-    """Load pre-exported chart_candles JSON and build M1 + M5."""
-    print(f"[DryRun] Loading JSON candles from {json_path}...")
-    with open(json_path) as f:
-        candles = json.load(f)
-
-    df_m1 = pd.DataFrame(candles)
-    df_m1['time'] = pd.to_datetime(df_m1['time'], unit='s')
-    df_m1.set_index('time', inplace=True)
-    df_m1.sort_index(inplace=True)
-    if 'volume' not in df_m1.columns:
-        df_m1['volume'] = 1  # Placeholder
-
-    # Resample to M5
-    df_m5 = df_m1.resample('5min').agg({
-        'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
-    })
-    df_m5.dropna(inplace=True)
-
-    return df_m1, df_m5
-
-
-def try_load_cached(dataset_id):
-    """Try to load from pickle cache first (much faster)."""
     m1_path = os.path.join(DATA_DIR, f'xau_m1_cache_{dataset_id}.pkl')
     m5_path = os.path.join(DATA_DIR, f'xau_m5_cache_{dataset_id}.pkl')
+
     if os.path.exists(m1_path) and os.path.exists(m5_path):
-        print(f"[DryRun] Loading from pickle cache ({dataset_id})...")
+        print(f"Loading cached M1/M5 from {m1_path}...")
         df_m1 = pd.read_pickle(m1_path)
         df_m5 = pd.read_pickle(m5_path)
-        # Ensure volume is never 0
-        df_m1['volume'] = df_m1['volume'].replace(0, 1)
-        df_m5['volume'] = df_m5['volume'].replace(0, 1)
-        return df_m1, df_m5
-    return None, None
+    else:
+        if not os.path.exists(csv_path):
+            print(f"Error: {csv_path} not found.")
+            return None, None, None
+
+        print(f"Reading tick data from {csv_path}...")
+        start = time.time()
+        df_tick = pd.read_csv(csv_path, header=None, names=['time_str', 'bid', 'ask', 'volume'])
+        df_tick['time_str'] = df_tick['time_str'] + '000'
+        df_tick['time'] = pd.to_datetime(df_tick['time_str'], format='%Y%m%d %H%M%S%f')
+        df_tick['price'] = (df_tick['bid'] + df_tick['ask']) / 2.0
+        df_tick.set_index('time', inplace=True)
+        df_tick.sort_index(inplace=True)
+        print(f"Parsed {len(df_tick)} ticks in {time.time() - start:.1f}s. Resampling...")
+
+        def agg_tf(freq):
+            df_agg = df_tick.resample(freq).agg({
+                'price': ['first', 'max', 'min', 'last'],
+                'volume': 'sum'
+            })
+            df_agg.columns = ['open', 'high', 'low', 'close', 'volume']
+            df_agg.dropna(inplace=True)
+            return df_agg
+
+        df_m1 = agg_tf('1min')
+        df_m5 = agg_tf('5min')
+
+        df_m1.to_pickle(m1_path)
+        df_m5.to_pickle(m5_path)
+        print("Cached.")
+
+    return df_m1, df_m5, dataset_id
 
 
-# ===================== INDICATORS =====================
+def load_from_mongo():
+    """Load M1 candles from MongoDB, resample to M5."""
+    from pymongo import MongoClient
 
-def attach_indicators(df):
-    """Compute all indicators on a DataFrame (same logic as main.py)."""
-    df['ema9'] = calc_ema(df['close'], 9)
-    df['ema21'] = calc_ema(df['close'], 21)
-    df['ema50'] = calc_ema(df['close'], 50)
-    df['rsi'] = calc_rsi(df['close'], 14)
-    df['atr'] = calc_atr(df, 14)
-    df['bb_sma'] = df['close'].rolling(20).mean()
-    df['bb_std'] = df['close'].rolling(20).std()
-    df['upper_bb'] = df['bb_sma'] + (df['bb_std'] * 2.0)
-    df['lower_bb'] = df['bb_sma'] - (df['bb_std'] * 2.0)
-    df['vol_sma20'] = df['volume'].rolling(20).mean()
-    return df
+    mongo_uri = os.getenv('MONGODB_URI', 'mongodb://localhost:27017/trading')
+    symbol = os.getenv('SYMBOL', 'OANDA:XAU_USD')
+
+    client = MongoClient(mongo_uri)
+    db = client.get_default_database()
+
+    docs = list(db.candles.find({
+        'symbol': symbol, 'interval': '1m'
+    }).sort('timestamp', 1))
+
+    if not docs:
+        print("No M1 candles found in MongoDB.")
+        return None, None, 'mongo'
+
+    df_m1 = pd.DataFrame(docs)
+    df_m1['timestamp'] = pd.to_datetime(df_m1['timestamp'], utc=True)
+    df_m1.set_index('timestamp', inplace=True)
+    df_m1.sort_index(inplace=True)
+
+    if 'tickVolume' in df_m1.columns:
+        df_m1['volume'] = df_m1['tickVolume'].where(df_m1['tickVolume'] > 0, df_m1.get('volume', 1))
+    df_m1['volume'] = df_m1['volume'].fillna(1).replace(0, 1)
+
+    df_m5 = resample_m5(df_m1)
+
+    # Also pull actual paper trades for comparison
+    actual_trades = list(db.paper_trades.find({'status': 'CLOSED'}).sort('entryTime', 1))
+
+    return df_m1, df_m5, 'mongo', actual_trades
 
 
-def attach_indicators_prefixed(df, prefix):
-    """Compute indicators and rename columns with prefix for merging."""
-    df = attach_indicators(df)
-    rename = {}
-    for c in df.columns:
-        if c not in ['open', 'high', 'low', 'close', 'volume']:
-            rename[c] = f"{c}_{prefix}"
-        else:
-            rename[c] = f"{c}_{prefix}"
-    df.rename(columns=rename, inplace=True)
-    return df
+# ===================== SNAPSHOT BUILDER =====================
 
+def build_snapshot_for_bar(df_m1, df_m5, df_m5_shifted, i, m5_idx):
+    """Build a MarketSnapshot for M1 bar at index position i.
 
-# ===================== STRATEGY ENGINE =====================
-
-def run_backtest(df_m1, df_m5):
+    This mirrors main.py's build_snapshot() but works with positional indices
+    for batch iteration.
     """
-    Execute all 3 strategies against historical data.
-    Uses the EXACT same conditions as main.py (which matches XAUUSD_STRATEGIES.md).
-    Returns list of trade dicts in the same format as data/dry_run_xau.py.
-    """
-    print(f"[DryRun] Computing indicators on {len(df_m1)} M1 and {len(df_m5)} M5 candles...")
+    m1 = df_m1.iloc[i]
 
-    # Compute M1 indicators
+    if pd.isna(m1['rsi']) or pd.isna(m1['ema21']):
+        return None
+
+    m5 = df_m5_shifted.iloc[m5_idx]
+
+    if pd.isna(m5['atr']) or pd.isna(m5['ema9']) or pd.isna(m5['rsi']):
+        return None
+
+    # Slope lookback: find M5 bar 3 bars before the current shifted M5
+    has_slope = False
+    m5_ema9_prev = None
+    m5_ema21_prev = None
+    if m5_idx >= 3:
+        m5_prev = df_m5.iloc[m5_idx - 3]
+        if not pd.isna(m5_prev['ema9']) and not pd.isna(m5_prev['ema21']):
+            has_slope = True
+            m5_ema9_prev = m5_prev['ema9']
+            m5_ema21_prev = m5_prev['ema21']
+
+    return MarketSnapshot(
+        m1_close=m1['close'],
+        m1_high=m1['high'],
+        m1_low=m1['low'],
+        m1_rsi=m1['rsi'],
+        m1_ema21=m1['ema21'],
+        m1_upper_bb=m1['upper_bb'],
+        m1_lower_bb=m1['lower_bb'],
+        m1_bb_sma=m1['bb_sma'],
+        m1_atr=m1['atr'],
+        m5_atr=m5['atr'],
+        m5_ema9=m5['ema9'],
+        m5_ema21=m5['ema21'],
+        m5_ema50=m5['ema50'],
+        m5_rsi=m5['rsi'],
+        m5_close=m5['close'],
+        m5_upper_bb=m5['upper_bb'],
+        m5_lower_bb=m5['lower_bb'],
+        m5_volume=m5['volume'],
+        m5_vol_sma20=m5['vol_sma20'] if not pd.isna(m5['vol_sma20']) else 1,
+        m5_ema9_prev=m5_ema9_prev,
+        m5_ema21_prev=m5_ema21_prev,
+        has_slope_data=has_slope,
+        live_price=None,  # dry-run uses m1_close
+    )
+
+
+# ===================== CORE DRY-RUN =====================
+
+def run_dry_run(df_m1, df_m5, dataset_id, trend_filter=True, spread_offset=0.0):
+    """Run the strategy engine over historical M1/M5 data.
+
+    Returns (total_pnl, win_rate, trade_count, final_trades) or None.
+    """
+    print(f"\n{'='*60}")
+    print(f"  Dataset: {dataset_id}")
+    print(f"{'='*60}")
+    print(f"Data: M1({len(df_m1)} rows), M5({len(df_m5)} rows)")
+
+    print("Computing indicators...")
     df_m1 = attach_indicators(df_m1)
+    df_m5 = attach_indicators(df_m5)
 
-    # Compute M5 indicators with prefix
-    df_m5 = attach_indicators_prefixed(df_m5, 'm5')
+    # Shift M5 by 1 to prevent lookahead (same as main.py)
+    df_m5_shifted = df_m5.shift(1)
 
-    # M5 shifted by 1 bar to prevent lookahead, then forward-filled onto M1 index
-    df_m5_shifted = df_m5.shift(1).copy()
-    df_m5_shifted = df_m5_shifted.reindex(df_m1.index, method='ffill')
+    # Reindex M5_shifted onto M1 index for fast lookup
+    # For each M1 bar, find the corresponding M5_shifted bar
+    m5_shifted_times = df_m5_shifted.index.values
+    m1_times = df_m1.index.values
 
-    # Join M5 onto M1
-    df = df_m1.join(df_m5_shifted, lsuffix='', rsuffix='_m5_dup')
-    df.dropna(inplace=True)
+    print(f"Scanning {len(df_m1)} bars...")
 
-    print(f"[DryRun] Scanning {len(df)} aligned candles for strategy signals...")
-
-    # Vectorized arrays for speed (identical to data/dry_run_xau.py)
-    times = df.index.values
-    closes = df['close'].values
-    highs = df['high'].values
-    lows = df['low'].values
-
-    # M1 indicators
-    m1_e21s = df['ema21'].values
-    rsis = df['rsi'].values
-    uppers = df['upper_bb'].values
-    lowers = df['lower_bb'].values
-
-    # M5 indicators
-    m5_e9s = df['ema9_m5'].values
-    m5_e21s = df['ema21_m5'].values
-    m5_e50s = df['ema50_m5'].values
-    m5_atrs = df['atr_m5'].values
-    m5_vol = df['volume_m5'].values
-    m5_volsma = df['vol_sma20_m5'].values
-    m5_uppers = df['upper_bb_m5'].values
-    m5_lowers = df['lower_bb_m5'].values
-    m5_closes = df['close_m5'].values
-
+    cooldowns = CooldownState()
     executed_orders = []
-    last_ema_t = pd.Timestamp(0)
-    last_bb_t = pd.Timestamp(0)
-    last_inst_t = pd.Timestamp(0)
 
-    for i in range(len(df)):
-        t = pd.Timestamp(times[i])
-        live_price = closes[i]
+    for i in range(50, len(df_m1)):
+        t = df_m1.index[i]
 
-        # Global guard: M5 ATR must be alive
-        if m5_atrs[i] < 0.05:
+        # Convert timestamp to seconds for cooldown comparison
+        if hasattr(t, 'timestamp'):
+            now_secs = t.timestamp()
+        else:
+            now_secs = pd.Timestamp(t).timestamp()
+
+        # Find M5 shifted index for this M1 bar
+        m5_idx = np.searchsorted(m5_shifted_times, m1_times[i], side='right') - 1
+        if m5_idx < 0 or m5_idx >= len(df_m5_shifted):
             continue
 
-        # ==================== STRATEGY A: EMA Trend Pullback ====================
-        if t - last_ema_t > COOLDOWN:
-            m5_bull = m5_e9s[i] > m5_e21s[i] > m5_e50s[i]
-            m5_bear = m5_e9s[i] < m5_e21s[i] < m5_e50s[i]
+        # Build snapshot (same logic as main.py's build_snapshot)
+        snap = build_snapshot_for_bar(df_m1, df_m5, df_m5_shifted, i, m5_idx)
+        if snap is None:
+            continue
 
-            direction = None
-            if m5_bull and lows[i] <= m1_e21s[i] and rsis[i] <= 45:
-                direction = 'LONG'
-            elif m5_bear and highs[i] >= m1_e21s[i] and rsis[i] >= 55:
-                direction = 'SHORT'
+        # Evaluate strategies — THE SAME FUNCTION AS LIVE
+        signals = evaluate_strategies(snap, cooldowns, now_secs, spread_offset, trend_filter)
 
-            if direction:
-                last_ema_t = t
-                tp_dist = m5_atrs[i] * 3.0
-                sl_dist = m5_atrs[i] * 1.2
-                tp = live_price + tp_dist if direction == 'LONG' else live_price - tp_dist
-                sl = live_price - sl_dist if direction == 'LONG' else live_price + sl_dist
+        for sig in signals:
+            executed_orders.append({
+                'strat': sig.strategy,
+                'dir': sig.direction,
+                'entry': sig.entry_price,
+                'time': t,
+                'tp': sig.tp,
+                'sl': sig.sl,
+                'status': 'PENDING',
+                'meta': sig.meta,
+            })
 
-                meta = {
-                    'rule': f"M5 EMA alignment ({'9>21>50 BULL' if m5_bull else '9<21<50 BEAR'}), M1 pullback to EMA21, M1 RSI reset",
-                    'm1_close': round(live_price, 3),
-                    'm1_ema21': round(m1_e21s[i], 3),
-                    'm1_rsi': round(rsis[i], 2),
-                    'm5_ema9': round(m5_e9s[i], 3),
-                    'm5_ema21': round(m5_e21s[i], 3),
-                    'm5_ema50': round(m5_e50s[i], 3),
-                    'm5_atr': round(m5_atrs[i], 3),
-                    'tp_mult': 3.0, 'sl_mult': 1.2,
-                }
-                executed_orders.append({
-                    'strat': 'EMA_PULLBACK', 'dir': direction,
-                    'entry': live_price, 'time': t,
-                    'tp': tp, 'sl': sl, 'status': 'PENDING', 'meta': meta
-                })
+    print(f"Generated {len(executed_orders)} signals. Resolving TP/SL...")
 
-        # ==================== STRATEGY B: Bollinger Mean Reversion ====================
-        if t - last_bb_t > COOLDOWN:
-            direction = None
-            bb_trigger = ''
-
-            if highs[i] > uppers[i] and rsis[i] >= 75:
-                direction = 'SHORT'
-                bb_trigger = f"M1 High ({round(highs[i],3)}) > Upper BB ({round(uppers[i],3)}), RSI {round(rsis[i],2)} >= 75"
-            elif lows[i] < lowers[i] and rsis[i] <= 25:
-                direction = 'LONG'
-                bb_trigger = f"M1 Low ({round(lows[i],3)}) < Lower BB ({round(lowers[i],3)}), RSI {round(rsis[i],2)} <= 25"
-
-            if direction:
-                last_bb_t = t
-                tp_dist = m5_atrs[i] * 2.0
-                sl_dist = m5_atrs[i] * 1.5
-                tp = live_price + tp_dist if direction == 'LONG' else live_price - tp_dist
-                sl = live_price - sl_dist if direction == 'LONG' else live_price + sl_dist
-
-                meta = {
-                    'rule': bb_trigger,
-                    'm1_close': round(live_price, 3),
-                    'm1_upper_bb': round(uppers[i], 3),
-                    'm1_lower_bb': round(lowers[i], 3),
-                    'm1_rsi': round(rsis[i], 2),
-                    'm5_atr': round(m5_atrs[i], 3),
-                    'tp_mult': 2.0, 'sl_mult': 1.5,
-                }
-                executed_orders.append({
-                    'strat': 'BB_REVERSION', 'dir': direction,
-                    'entry': live_price, 'time': t,
-                    'tp': tp, 'sl': sl, 'status': 'PENDING', 'meta': meta
-                })
-
-        # ==================== STRATEGY C: Institutional Breakout ====================
-        if t - last_inst_t > COOLDOWN:
-            vol_ratio = (m5_vol[i] / m5_volsma[i]) if m5_volsma[i] > 0 else 0
-
-            direction = None
-            if vol_ratio > 2.0:
-                if m5_closes[i] > m5_uppers[i] and lows[i] <= m5_e9s[i]:
-                    direction = 'LONG'
-                elif m5_closes[i] < m5_lowers[i] and highs[i] >= m5_e9s[i]:
-                    direction = 'SHORT'
-
-            if direction:
-                last_inst_t = t
-                tp_dist = m5_atrs[i] * 4.0
-                sl_dist = m5_atrs[i] * 1.0
-                tp = live_price + tp_dist if direction == 'LONG' else live_price - tp_dist
-                sl = live_price - sl_dist if direction == 'LONG' else live_price + sl_dist
-
-                meta = {
-                    'rule': f"M5 Vol surge ({round(vol_ratio,1)}x > 2.0x SMA20), M5 close {'above Upper BB' if m5_closes[i] > m5_uppers[i] else 'below Lower BB'}, M1 pullback to M5 EMA9",
-                    'm1_close': round(live_price, 3),
-                    'm5_volume': round(m5_vol[i], 0),
-                    'm5_vol_ratio': round(vol_ratio, 2),
-                    'm5_close': round(m5_closes[i], 3),
-                    'm5_ema9': round(m5_e9s[i], 3),
-                    'm5_atr': round(m5_atrs[i], 3),
-                    'tp_mult': 4.0, 'sl_mult': 1.0,
-                }
-                executed_orders.append({
-                    'strat': 'INST_BREAKOUT', 'dir': direction,
-                    'entry': live_price, 'time': t,
-                    'tp': tp, 'sl': sl, 'status': 'PENDING', 'meta': meta
-                })
-
-    # ==================== FORWARD PATH RESOLUTION ====================
-    print(f"[DryRun] {len(executed_orders)} signals. Resolving TP/SL forward...")
+    # ─── Forward-scan TP/SL resolution ───
+    # Normalize to tz-naive for numpy operations
+    df_naive = df_m1.copy()
+    if df_naive.index.tz is not None:
+        df_naive.index = df_naive.index.tz_localize(None)
+    times = df_naive.index.values
+    highs = df_naive['high'].values
+    lows = df_naive['low'].values
 
     final_trades = []
     for tr in executed_orders:
-        t_entry = tr['time'].to_datetime64()
+        t_raw = tr['time']
+        if hasattr(t_raw, 'tz') and t_raw.tz is not None:
+            t_raw = t_raw.tz_localize(None)
+        t_entry = pd.Timestamp(t_raw).to_datetime64()
         start_idx = np.searchsorted(times, t_entry)
-        future_highs = highs[start_idx:start_idx + 1000]
-        future_lows = lows[start_idx:start_idx + 1000]
-        future_times = times[start_idx:start_idx + 1000]
+
+        future_highs = highs[start_idx: start_idx + 1000]
+        future_lows = lows[start_idx: start_idx + 1000]
+        future_times = times[start_idx: start_idx + 1000]
 
         if len(future_highs) == 0:
             continue
@@ -334,194 +281,282 @@ def run_backtest(df_m1, df_m5):
             tr['status'] = 'UNCLOSED'
             continue
 
-        exit_idx = tp_idx if tp_idx <= sl_idx else sl_idx
-
         if tp_idx <= sl_idx:
             tr['exit'] = tr['tp']
-            tr['exit_time'] = future_times[exit_idx]
+            tr['exit_time'] = future_times[tp_idx]
             tr['pnl'] = abs(tr['exit'] - tr['entry']) * POSITION_OZ
             tr['status'] = 'CLOSED_TP'
         else:
             tr['exit'] = tr['sl']
-            tr['exit_time'] = future_times[exit_idx]
+            tr['exit_time'] = future_times[sl_idx]
             tr['pnl'] = -abs(tr['entry'] - tr['exit']) * POSITION_OZ
             tr['status'] = 'CLOSED_SL'
 
-        tr['duration_mins'] = int((tr['exit_time'] - tr['time']) / np.timedelta64(1, 'm'))
+        t_naive = tr['time'].tz_localize(None) if hasattr(tr['time'], 'tz') and tr['time'].tz else tr['time']
+        tr['duration_mins'] = int((tr['exit_time'] - pd.Timestamp(t_naive).to_datetime64()) / np.timedelta64(1, 'm'))
         final_trades.append(tr)
 
-    return df_m1, final_trades
+    unclosed = [o for o in executed_orders if o['status'] == 'UNCLOSED']
+    df_res = pd.DataFrame(final_trades) if final_trades else pd.DataFrame()
 
+    if len(df_res) == 0:
+        print("No trades resolved.")
+        return None
 
-# ===================== RESULTS & EXPORT =====================
-
-def print_results(final_trades, dataset_label):
-    """Print backtest results summary."""
-    if not final_trades:
-        print(f"[DryRun] No trades resolved for {dataset_label}.")
-        return 0, 0, 0
-
-    df_res = pd.DataFrame(final_trades)
+    # ─── Report ───
     overall_pnl = df_res['pnl'].sum()
     overall_wr = len(df_res[df_res['pnl'] > 0]) / len(df_res) * 100
     df_res['cum_pnl'] = df_res['pnl'].cumsum()
     max_dd = (df_res['cum_pnl'].cummax() - df_res['cum_pnl']).max()
+    avg_win = df_res[df_res['pnl'] > 0]['pnl'].mean() if len(df_res[df_res['pnl'] > 0]) > 0 else 0
+    avg_loss = df_res[df_res['pnl'] < 0]['pnl'].mean() if len(df_res[df_res['pnl'] < 0]) > 0 else 0
+    avg_dur = df_res['duration_mins'].mean()
+    pf = (df_res[df_res['pnl'] > 0]['pnl'].sum() / abs(df_res[df_res['pnl'] < 0]['pnl'].sum())) if df_res[df_res['pnl'] < 0]['pnl'].sum() != 0 else float('inf')
+    wins = len(df_res[df_res['pnl'] > 0])
+    losses = len(df_res) - wins
 
-    print(f"\n{'='*60}")
-    print(f"  DRY RUN RESULTS — {dataset_label}")
-    print(f"{'='*60}")
-    print(f"  Net PnL:      ${overall_pnl:.2f}")
-    print(f"  Win Rate:     {overall_wr:.1f}%")
-    print(f"  Max Drawdown: ${max_dd:.2f}")
-    print(f"  Total Trades: {len(df_res)}")
-    print()
+    print(f"""
+{'='*60}
+  🏆 DRY RUN RESULTS — {dataset_id}
+{'='*60}
+  Signals:     {len(executed_orders):>6}  (Closed: {len(final_trades)}, Unclosed: {len(unclosed)})
+  Net PnL:     ${overall_pnl:>10.2f}
+  Win Rate:    {overall_wr:>9.1f}%  ({wins}W / {losses}L)
+  Profit Factor: {pf:>7.2f}
+  Max Drawdown: ${max_dd:>9.2f}
+  Avg Win:     ${avg_win:>10.2f}
+  Avg Loss:    ${avg_loss:>10.2f}
+  Avg Hold:    {avg_dur:>7.0f} min
+""")
 
+    # Strategy breakdown
+    print("─── STRATEGY BREAKDOWN ─────────────────────────────────────")
     for strat in ['EMA_PULLBACK', 'BB_REVERSION', 'INST_BREAKOUT']:
         s_tr = df_res[df_res['strat'] == strat]
         if len(s_tr) > 0:
-            s_wr = len(s_tr[s_tr['pnl'] > 0]) / len(s_tr) * 100
+            s_wins = len(s_tr[s_tr['pnl'] > 0])
+            s_wr = s_wins / len(s_tr) * 100
             s_pnl = s_tr['pnl'].sum()
-            avg_dur = s_tr['duration_mins'].mean()
-            print(f"  {strat:15s} | WR: {s_wr:5.1f}% | Net: ${s_pnl:8.2f} | Hold: {avg_dur:4.0f}m | Trades: {len(s_tr)}")
+            s_pf = (s_tr[s_tr['pnl'] > 0]['pnl'].sum() / abs(s_tr[s_tr['pnl'] < 0]['pnl'].sum())) if s_tr[s_tr['pnl'] < 0]['pnl'].sum() != 0 else float('inf')
+            print(f"  {strat:17s} │ {s_wins}W/{len(s_tr)-s_wins}L │ WR: {s_wr:5.1f}% │ PnL: ${s_pnl:8.2f} │ PF: {s_pf:5.2f}")
+            for d in ['LONG', 'SHORT']:
+                d_tr = s_tr[s_tr['dir'] == d]
+                if len(d_tr) > 0:
+                    d_wins = len(d_tr[d_tr['pnl'] > 0])
+                    d_wr = d_wins / len(d_tr) * 100
+                    d_pnl = d_tr['pnl'].sum()
+                    print(f"    └─ {d:5s}       │ {d_wins}W/{len(d_tr)-d_wins}L │ WR: {d_wr:5.1f}% │ PnL: ${d_pnl:8.2f}")
         else:
-            print(f"  {strat:15s} | No triggers")
+            print(f"  {strat:17s} │ No triggers")
 
-    print(f"{'='*60}")
-    return overall_pnl, overall_wr, len(df_res)
+    print("=" * 60)
+
+    return overall_pnl, overall_wr, len(df_res), final_trades
 
 
 def export_json(df_m1, final_trades, dataset_id):
-    """Export JSON files in the same format as data/dry_run_xau.py for chart visualization."""
-    # Candles JSON
-    df_export = df_m1[['open', 'high', 'low', 'close']].copy().reset_index()
-    df_export.columns = ['time'] + list(df_export.columns[1:])
-    df_export['time'] = (df_export['time'].astype(np.int64) // 10**9)
+    """Export candles + trades as JSON for dashboard visualization."""
+    # Candles
+    df_export = df_m1[['open', 'high', 'low', 'close']].copy()
+    df_export = df_export.reset_index()
+    time_col = df_export.columns[0]
+    df_export[time_col] = (pd.to_datetime(df_export[time_col]).astype(np.int64) // 10**9)
+    df_export = df_export.rename(columns={time_col: 'time'})
     df_export.sort_values('time', inplace=True)
+    df_export = df_export[['time', 'open', 'high', 'low', 'close']]
 
-    candles_path = os.path.join(OUTPUT_DIR, f"dryrun_candles_{dataset_id}.json")
-    df_export[['time', 'open', 'high', 'low', 'close']].to_json(candles_path, orient='records')
+    candles_path = os.path.join(DATA_DIR, f"chart_candles_{dataset_id}.json")
+    df_export.to_json(candles_path, orient='records')
 
-    # Trades JSON
+    # Trades
     trades_export = []
     for tr in final_trades:
+        t_entry = int(pd.Timestamp(tr['time']).timestamp())
+        t_exit = int(pd.Timestamp(tr['exit_time']).timestamp()) if 'exit_time' in tr else 0
         trades_export.append({
-            'strat': tr['strat'],
-            'dir': tr['dir'],
-            'entry': round(tr['entry'], 3),
-            'time': int(pd.Timestamp(tr['time']).timestamp()),
-            'tp': round(tr['tp'], 3),
-            'sl': round(tr['sl'], 3),
+            'strat': tr['strat'], 'dir': tr['dir'],
+            'entry': round(tr['entry'], 3), 'time': t_entry,
+            'tp': round(tr['tp'], 3), 'sl': round(tr['sl'], 3),
             'status': tr['status'],
-            'exit': round(tr['exit'], 3),
-            'exit_time': int(pd.Timestamp(tr['exit_time']).timestamp()),
-            'pnl': round(tr['pnl'], 2),
-            'duration_mins': tr['duration_mins'],
-            'meta': tr.get('meta', {})
+            'exit': round(tr.get('exit', 0), 3), 'exit_time': t_exit,
+            'pnl': round(tr.get('pnl', 0), 2),
+            'duration_mins': tr.get('duration_mins', 0),
+            'meta': tr.get('meta', {}),
         })
 
-    trades_path = os.path.join(OUTPUT_DIR, f"dryrun_trades_{dataset_id}.json")
-    with open(trades_path, 'w') as f:
+    trades_path = os.path.join(DATA_DIR, f"chart_trades_{dataset_id}.json")
+    with open(trades_path, "w") as f:
         json.dump(trades_export, f)
 
-    print(f"[DryRun] Exported: {candles_path}")
-    print(f"[DryRun] Exported: {trades_path}")
-    return candles_path, trades_path
+    print(f"Exported: {candles_path}, {trades_path}")
 
 
-# ===================== MAIN CLI =====================
+# ===================== ENTRY POINTS =====================
 
-DATASETS = {
-    '202601': 'DAT_ASCII_XAUUSD_T_202601.csv',
-    '202602': 'DAT_ASCII_XAUUSD_T_202602.csv',
-    '202603': 'DAT_ASCII_XAUUSD_T_202603.csv',
-}
+def run_csv_mode(csv_arg, trend_filter=True):
+    """Run against CSV tick data files."""
+    DATASETS = {
+        '202601': os.path.join(DATA_DIR, 'DAT_ASCII_XAUUSD_T_202601.csv'),
+        '202602': os.path.join(DATA_DIR, 'DAT_ASCII_XAUUSD_T_202602.csv'),
+        '202603': os.path.join(DATA_DIR, 'DAT_ASCII_XAUUSD_T_202603.csv'),
+    }
 
-
-def run_single(source_path):
-    """Run a single backtest from a CSV or JSON file."""
-    basename = os.path.basename(source_path)
-
-    # Determine dataset ID from filename
-    dataset_id = None
-    for did, fname in DATASETS.items():
-        if fname in basename:
-            dataset_id = did
-            break
-
-    if dataset_id is None:
-        # Try to extract from filename pattern
-        import re
-        m = re.search(r'(\d{6})', basename)
-        dataset_id = m.group(1) if m else basename.replace('.', '_')
-
-    # Try pickle cache first
-    df_m1, df_m5 = try_load_cached(dataset_id)
-
-    if df_m1 is None:
-        if source_path.endswith('.csv'):
-            df_m1, df_m5 = load_csv_ticks(source_path)
-        elif source_path.endswith('.json'):
-            df_m1, df_m5 = load_json_candles(source_path)
-        else:
-            print(f"[DryRun] Unsupported file: {source_path}")
-            return None
-
-    df_m1, final_trades = run_backtest(df_m1, df_m5)
-    pnl, wr, count = print_results(final_trades, dataset_id)
-    export_json(df_m1, final_trades, dataset_id)
-    return pnl, wr, count
-
-
-def main():
-    if len(sys.argv) < 2:
-        print("Usage:")
-        print("  python dry_run.py <csv_or_json_path>")
-        print("  python dry_run.py all")
-        print()
-        print("Examples:")
-        print("  python dry_run.py ../../data/DAT_ASCII_XAUUSD_T_202603.csv")
-        print("  python dry_run.py ../../data/chart_candles_202603.json")
-        print("  python dry_run.py all")
-        sys.exit(1)
-
-    arg = sys.argv[1]
-
-    if arg == 'all':
-        print("\n" + "#" * 60)
-        print("  ANALYZER DRY RUN — ALL DATASETS")
-        print("#" * 60)
+    if csv_arg == 'all':
         summary = []
-        for did, fname in sorted(DATASETS.items()):
-            fpath = os.path.join(DATA_DIR, fname)
-            if not os.path.exists(fpath):
-                print(f"[DryRun] Skipping {fname} (not found)")
-                continue
-            result = run_single(fpath)
-            if result:
-                summary.append((did, *result))
+        for ds_id, path in DATASETS.items():
+            df_m1, df_m5, dataset_id = load_from_csv(path)
+            if df_m1 is not None:
+                result = run_dry_run(df_m1, df_m5, dataset_id, trend_filter)
+                if result:
+                    pnl, wr, count, trades = result
+                    summary.append((dataset_id, pnl, wr, count))
+                    export_json(df_m1, trades, dataset_id)
 
         if summary:
-            print("\n" + "#" * 60)
+            print(f"\n{'#'*60}")
             print("  CROSS-DATASET COMPARISON (0.01 lot / 1 oz)")
-            print("#" * 60)
-            total_pnl = 0
-            for d, pnl, wr, count in summary:
-                print(f"  {d}  |  WR: {wr:5.1f}%  |  Net PnL: ${pnl:8.2f}  |  Trades: {count}")
-                total_pnl += pnl
-            print(f"  {'TOTAL':6s}  |  Combined Net PnL: ${total_pnl:.2f}")
-            print("#" * 60)
+            print(f"{'#'*60}")
+            total = 0
+            for ds, pnl, wr, count in summary:
+                print(f"  {ds}  |  WR: {wr:5.1f}%  |  Net PnL: ${pnl:8.2f}  |  Trades: {count}")
+                total += pnl
+            print(f"  {'TOTAL':6s}  |  Combined Net PnL: ${total:.2f}")
+            print(f"{'#'*60}")
+
+    elif csv_arg == 'compare':
+        datasets = list(DATASETS.keys())
+        print("\n" + "=" * 80)
+        print("  RUNNING WITHOUT TREND FILTER")
+        print("=" * 80)
+        no_filter = []
+        for ds_id in datasets:
+            df_m1, df_m5, did = load_from_csv(DATASETS[ds_id])
+            if df_m1 is not None:
+                result = run_dry_run(df_m1, df_m5, did, trend_filter=False)
+                if result: no_filter.append((did, result[0], result[1], result[2]))
+
+        print("\n" + "=" * 80)
+        print("  RUNNING WITH TREND FILTER")
+        print("=" * 80)
+        with_filter = []
+        for ds_id in datasets:
+            df_m1, df_m5, did = load_from_csv(DATASETS[ds_id])
+            if df_m1 is not None:
+                result = run_dry_run(df_m1, df_m5, did, trend_filter=True)
+                if result: with_filter.append((did, result[0], result[1], result[2]))
+
+        # Build comparison table
+        nf_dict = {d: (p, w, c) for d, p, w, c in no_filter}
+        wf_dict = {d: (p, w, c) for d, p, w, c in with_filter}
+        print("\n╔" + "═" * 78 + "╗")
+        print("║" + "  M5 TREND FILTER — BEFORE vs AFTER COMPARISON".center(78) + "║")
+        print("╠" + "═" * 78 + "╣")
+        total_b, total_a = 0, 0
+        for d in datasets:
+            if d in nf_dict and d in wf_dict:
+                bp, bw, bc = nf_dict[d]
+                ap, aw, ac = wf_dict[d]
+                delta = ap - bp
+                total_b += bp; total_a += ap
+                sign = "+" if delta >= 0 else ""
+                line = f"  {d}    │  ${bp:8.2f} WR:{bw:4.1f}% #{bc:4d} │  ${ap:8.2f} WR:{aw:4.1f}% #{ac:4d} │ {sign}${delta:.2f}"
+                print("║" + line.ljust(78) + "║")
+        print("╠" + "═" * 78 + "╣")
+        td = total_a - total_b
+        sign = "+" if td >= 0 else ""
+        line = f"  TOTAL    │  ${total_b:8.2f}              │  ${total_a:8.2f}              │ {sign}${td:.2f}"
+        print("║" + line.ljust(78) + "║")
+        print("╚" + "═" * 78 + "╝")
+
     else:
-        # Single file path
-        source = arg
-        if not os.path.isabs(source):
-            source = os.path.join(os.getcwd(), source)
-        if not os.path.exists(source):
-            # Try relative to DATA_DIR
-            source = os.path.join(DATA_DIR, os.path.basename(arg))
-        if not os.path.exists(source):
-            print(f"[DryRun] File not found: {arg}")
-            sys.exit(1)
-        run_single(source)
+        # Single file
+        if csv_arg in DATASETS:
+            csv_path = DATASETS[csv_arg]
+        else:
+            csv_path = csv_arg
+        df_m1, df_m5, dataset_id = load_from_csv(csv_path)
+        if df_m1 is not None:
+            result = run_dry_run(df_m1, df_m5, dataset_id, trend_filter)
+            if result:
+                export_json(df_m1, result[3], dataset_id)
+
+
+def run_mongo_mode():
+    """Run against MongoDB paper trading candles."""
+    result = load_from_mongo()
+    if result is None:
+        return
+    df_m1, df_m5, dataset_id, actual_trades = result
+
+    if df_m1 is None:
+        return
+
+    print(f"  Loaded {len(df_m1)} M1 candles from MongoDB")
+    print(f"  Range: {df_m1.index[0]} → {df_m1.index[-1]}")
+
+    result = run_dry_run(df_m1, df_m5, dataset_id, trend_filter=True,
+                         spread_offset=float(os.getenv('SPREAD_OFFSET', '0.0')))
+
+    if result is None:
+        return
+
+    sim_pnl, sim_wr, sim_count, final_trades = result
+
+    # Compare with actual paper trades
+    if actual_trades:
+        actual_pnl = sum(t.get('pnl', 0) for t in actual_trades)
+        actual_wins = sum(1 for t in actual_trades if t.get('pnl', 0) > 0)
+        actual_wr = (actual_wins / len(actual_trades) * 100) if actual_trades else 0
+
+        print(f"""
+─── ACTUAL PAPER TRADING COMPARISON ────────────────────────
+  Actual Trades: {len(actual_trades):>6}
+  Actual PnL:    ${actual_pnl:>10.2f}
+  Actual WR:     {actual_wr:>9.1f}%  ({actual_wins}W / {len(actual_trades)-actual_wins}L)
+  ──────────────────────
+  PnL Delta:     ${sim_pnl - actual_pnl:>+10.2f}  (sim - actual)
+""")
+        if abs(sim_pnl - actual_pnl) > 5:
+            print("  📊 Discrepancy is expected due to:")
+            print("     - Live uses real-time tick prices vs M1 bar close")
+            print("     - main.py checks idx=-2 (last completed) vs dry-run checks every bar")
+            print("     - Spread/slippage in live execution")
+
+    # Trade log
+    print("─── TRADE LOG ──────────────────────────────────────────────")
+    print(f"  {'#':>3} │ {'Strategy':17s} │ {'Dir':5s} │ {'Entry':>10s} │ {'Exit':>10s} │ {'PnL':>8s} │ {'Hold':>6s}")
+    print("  " + "─" * 80)
+    cum = 0
+    for i, tr in enumerate(final_trades):
+        cum += tr['pnl']
+        emoji = '✅' if tr['pnl'] > 0 else '❌'
+        print(f"  {i+1:>3} │ {tr['strat']:17s} │ {tr['dir']:5s} │ ${tr['entry']:>9.3f} │ ${tr['exit']:>9.3f} │ ${tr['pnl']:>+7.2f} │ {tr['duration_mins']:>4d}m {emoji} cum:${cum:+.2f}")
+
+
+# ===================== MAIN =====================
+
+def main():
+    parser = argparse.ArgumentParser(description='XAU/USD Strategy Dry-Run')
+    parser.add_argument('--csv', type=str, help='CSV file path, dataset ID (202601/202602/202603), "all", or "compare"')
+    parser.add_argument('--mongo', action='store_true', help='Run against MongoDB paper trading data')
+    parser.add_argument('--no-trend-filter', action='store_true', help='Disable M5 trend filter')
+
+    args = parser.parse_args()
+
+    if not args.csv and not args.mongo:
+        parser.print_help()
+        print("\nExamples:")
+        print("  python dry_run.py --csv 202603")
+        print("  python dry_run.py --csv all")
+        print("  python dry_run.py --csv compare")
+        print("  python dry_run.py --csv ../../data/DAT_ASCII_XAUUSD_T_202603.csv")
+        print("  python dry_run.py --mongo")
+        return
+
+    if args.csv:
+        run_csv_mode(args.csv, trend_filter=not args.no_trend_filter)
+    elif args.mongo:
+        run_mongo_mode()
 
 
 if __name__ == '__main__':

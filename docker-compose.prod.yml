@@ -1,0 +1,88 @@
+version: '3.8'
+
+# Production Docker Compose for 1 OCPU / 1GB RAM (OCI VM.Standard.E2.1.Micro)
+# No K3s, no ArgoCD — lightweight auto-deploy via git-pull cron
+
+services:
+  trading-db:
+    image: mongo:6.0
+    container_name: xau-trading-db
+    restart: always
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    networks:
+      - trading-net
+    deploy:
+      resources:
+        limits:
+          memory: 200M
+    command: ["mongod", "--wiredTigerCacheSizeGB", "0.1", "--quiet"]
+
+  data-ingest:
+    build:
+      context: ./services/data-ingest
+    container_name: xau-data-ingest
+    restart: always
+    ports:
+      - "4000:4000"
+    env_file:
+      - .env
+    environment:
+      - MONGODB_URI=mongodb://trading-db:27017/trading
+      - NOTIFICATION_URL=http://notification:4003/api/notify
+    depends_on:
+      - trading-db
+    networks:
+      - trading-net
+    deploy:
+      resources:
+        limits:
+          memory: 100M
+
+  analyzer:
+    build:
+      context: ./services/analyzer
+    container_name: xau-analyzer
+    restart: always
+    ports:
+      - "4002:4002"
+    env_file:
+      - .env
+    environment:
+      - MONGODB_URI=mongodb://trading-db:27017/trading
+      - NOTIFICATION_URL=http://notification:4003/api/notify
+    depends_on:
+      - trading-db
+      - data-ingest
+      - notification
+    networks:
+      - trading-net
+    deploy:
+      resources:
+        limits:
+          memory: 180M
+
+  notification:
+    build:
+      context: ./services/notification
+    container_name: xau-notification
+    restart: always
+    ports:
+      - "4003:4003"
+    env_file:
+      - .env
+    networks:
+      - trading-net
+    deploy:
+      resources:
+        limits:
+          memory: 80M
+
+volumes:
+  mongo-data:
+
+networks:
+  trading-net:
+    driver: bridge

@@ -500,8 +500,8 @@ export default function Dashboard() {
                       <td style={{ padding: '12px 16px', textAlign: 'center', fontSize: 11 }}>
                         {trade.tp && trade.sl ? (
                           <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-                            <span style={{ color: 'var(--accent-green)' }}>TP: ${Math.abs(trade.tp - trade.entryPrice).toFixed(2)}</span>
-                            <span style={{ color: 'var(--accent-red)' }}>SL: ${Math.abs(trade.sl - trade.entryPrice).toFixed(2)}</span>
+                            <span style={{ color: 'var(--accent-green)' }}>+${Math.abs(trade.tp - trade.entryPrice).toFixed(2)}</span>
+                            <span style={{ color: 'var(--accent-red)' }}>-${Math.abs(trade.sl - trade.entryPrice).toFixed(2)}</span>
                           </div>
                         ) : '--'}
                       </td>

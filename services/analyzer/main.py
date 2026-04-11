@@ -1,17 +1,16 @@
 """
 XAU/USD Strategy Analyzer — Live Paper Trading Engine
 =====================================================
-Implements the exact strategies from XAUUSD_STRATEGIES.md:
-  A) EMA Trend Pullback
-  B) Bollinger Band Mean Reversion
-  C) Institutional Breakout (Volume Anomaly)
+Thin orchestrator that:
+  1. Loads M1 candles from MongoDB
+  2. Builds a MarketSnapshot
+  3. Calls evaluate_strategies() from strategy.py (single source of truth)
+  4. Writes trades to MongoDB + sends notifications
+  5. Monitors open trades for TP/SL hits
+  6. Serves REST API for the frontend
 
-Primary scanning timeframe: M5 (indicators computed on M5)
-Entry precision: M1 candles trigger entries
-Volume: tickVolume field (tick count) used as reliable proxy
-
-Exness 0.01 lot sizing: 1 lot = 100 oz, 0.01 lot = 1 oz
-PnL = price_movement × 1.0
+All strategy logic lives in strategy.py — this file does NOT contain
+any entry conditions, indicator thresholds, or TP/SL multipliers.
 """
 
 import os
@@ -32,6 +31,14 @@ import requests
 from pymongo import MongoClient
 from dotenv import load_dotenv
 
+from strategy import (
+    calc_ema, calc_rsi, calc_atr,
+    attach_indicators, resample_m5,
+    evaluate_strategies,
+    MarketSnapshot, Signal, CooldownState,
+    LOT_SIZE, CONTRACT_SIZE, POSITION_OZ, COOLDOWN_SECS,
+)
+
 # Load shared .env from project root
 load_dotenv(os.path.join(os.path.dirname(__file__), '..', '..', '.env'))
 
@@ -39,39 +46,10 @@ MONGO_URI = os.getenv('MONGODB_URI', 'mongodb://localhost:27017/trading')
 SYMBOL = os.getenv('SYMBOL', 'OANDA:XAU_USD')
 ANALYZER_PORT = int(os.getenv('ANALYZER_PORT', '4002'))
 NOTIFICATION_URL = os.getenv('NOTIFICATION_URL', f"http://localhost:{os.getenv('NOTIFICATION_PORT', '4003')}/api/notify")
+SPREAD_OFFSET = float(os.getenv('SPREAD_OFFSET', '0.0'))
 
-LOT_SIZE = 0.01
-CONTRACT_SIZE = 100  # 1 lot = 100 oz
-POSITION_OZ = LOT_SIZE * CONTRACT_SIZE  # 1.0 oz
-
-# Cooldowns (seconds)
-COOLDOWN_SECS = 600  # 10 minutes (matches backtest)
-last_ema_time = 0.0
-last_bb_time = 0.0
-last_inst_time = 0.0
-
-
-# ===================== INDICATOR FUNCTIONS =====================
-
-def calc_ema(series, span):
-    return series.ewm(span=span, adjust=False).mean()
-
-def calc_rsi(series, period=14):
-    delta = series.diff()
-    gain = delta.where(delta > 0, 0.0)
-    loss = -delta.where(delta < 0, 0.0)
-    avg_gain = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-def calc_atr(df, period=14):
-    high_low = df['high'] - df['low']
-    high_close = (df['high'] - df['close'].shift()).abs()
-    low_close = (df['low'] - df['close'].shift()).abs()
-    ranges = pd.concat([high_low, high_close, low_close], axis=1)
-    true_range = ranges.max(axis=1)
-    return true_range.rolling(period).mean()
+# Cooldown state (persists across strategy runs)
+cooldowns = CooldownState()
 
 
 # ===================== NOTIFICATION HELPER =====================
@@ -84,7 +62,6 @@ def notify(type_: str, title: str, message: str, trade: dict = None):
     try:
         payload = {'type': type_, 'title': title, 'message': message}
         if trade:
-            # Sanitize MongoDB ObjectId — not JSON serializable
             clean = {k: str(v) if k == '_id' else v for k, v in trade.items()}
             payload['trade'] = clean
         resp = requests.post(NOTIFICATION_URL, json=payload, timeout=5)
@@ -115,47 +92,15 @@ def load_candles(db, symbol, limit=500):
         return None
 
     df = pd.DataFrame(docs)
-
-    # TIMESTAMP HANDLING: MongoDB stores as Date objects.
-    # Convert to pandas DatetimeIndex (UTC).
     df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
     df.set_index('timestamp', inplace=True)
     df.sort_index(inplace=True)
 
-    # Use tickVolume as volume if available and > 0, else fallback to volume field
+    # Use tickVolume as volume if available and > 0, else fallback
     if 'tickVolume' in df.columns:
         df['volume'] = df['tickVolume'].where(df['tickVolume'] > 0, df.get('volume', 1))
-    # Ensure volume is never 0 (prevents division errors)
     df['volume'] = df['volume'].fillna(1).replace(0, 1)
 
-    return df
-
-
-def resample_m5(df_m1):
-    """Resample M1 candles to M5 with tick volume."""
-    df_m5 = df_m1.resample('5min').agg({
-        'open': 'first',
-        'high': 'max',
-        'low': 'min',
-        'close': 'last',
-        'volume': 'sum'
-    })
-    df_m5.dropna(inplace=True)
-    return df_m5
-
-
-def attach_indicators(df):
-    """Compute all indicators on a DataFrame."""
-    df['ema9'] = calc_ema(df['close'], 9)
-    df['ema21'] = calc_ema(df['close'], 21)
-    df['ema50'] = calc_ema(df['close'], 50)
-    df['rsi'] = calc_rsi(df['close'], 14)
-    df['atr'] = calc_atr(df, 14)
-    df['bb_sma'] = df['close'].rolling(20).mean()
-    df['bb_std'] = df['close'].rolling(20).std()
-    df['upper_bb'] = df['bb_sma'] + (df['bb_std'] * 2.0)
-    df['lower_bb'] = df['bb_sma'] - (df['bb_std'] * 2.0)
-    df['vol_sma20'] = df['volume'].rolling(20).mean()
     return df
 
 
@@ -166,37 +111,184 @@ def get_live_price(db):
     tick = db.live_tick.find_one({'symbol': SYMBOL})
     if tick and (time.time() * 1000 - tick.get('timestamp', 0)) < 30000:
         return tick['price']
-    # Fallback to latest candle close
     candle = db.candles.find_one({'symbol': SYMBOL}, sort=[('timestamp', -1)])
     return candle['close'] if candle else None
 
 
-def format_trade_message(action, direction, price, tp, sl, strategy, meta):
-    """Format a trade notification message."""
-    emoji = '🟢' if direction == 'LONG' else '🔴'
-    lines = [
-        f"{emoji} <b>{action} {direction} | Entry: ${price:.2f} | TP: ${tp:.2f} | SL: ${sl:.2f}</b>",
-        f"Strategy: <b>{strategy}</b>",
-        f"Lot: 0.01 (1 oz)",
-        ""
-    ]
-    for k, v in meta.items():
-        if k == 'rule':
-            lines.append(f"📋 {v}")
+def _dir_arrow(direction, is_win=None):
+    """Return arrow icon for direction. ✅/❌ for win/loss, plain arrow for open."""
+    if direction == 'LONG':
+        if is_win is True:   return '✅↑'
+        if is_win is False:  return '❌↑'
+        return '↑'
+    else:
+        if is_win is True:   return '✅↓'
+        if is_win is False:  return '❌↓'
+        return '↓'
+
+
+def _fmt_time_short(epoch_ms):
+    """Format epoch ms to HH:MM local time string."""
+    from datetime import datetime, timezone, timedelta
+    tz = timezone(timedelta(hours=7))  # ICT
+    dt = datetime.fromtimestamp(epoch_ms / 1000, tz=tz)
+    return dt.strftime('%H:%M')
+
+
+def _get_today_trades(db):
+    """Get all trades from today (local ICT timezone), sorted latest first."""
+    from datetime import datetime, timezone, timedelta
+    tz = timezone(timedelta(hours=7))
+    now = datetime.now(tz)
+    start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_ms = int(start_of_day.timestamp() * 1000)
+    trades = list(db.paper_trades.find(
+        {'entryTime': {'$gte': start_ms}}
+    ).sort('entryTime', -1))
+    return trades
+
+
+def _build_trade_list(trades, live_price):
+    """Build the daily trade list lines.
+
+    Each line: Icon | opened_time | $amount | $entry | TP/SL | peak/low
+    Green for active, gray for closed.
+    """
+    lines = []
+    for t in trades:
+        direction = t.get('direction', '?')
+        status = t.get('status', '?')
+        entry = t.get('entryPrice', 0)
+        tp = t.get('tp', 0)
+        sl = t.get('sl', 0)
+        entry_time = _fmt_time_short(t.get('entryTime', 0))
+        peak = t.get('peakProfit', 0)
+        low = t.get('peakLoss', 0)
+
+        if status == 'CLOSED':
+            is_win = t.get('pnl', 0) > 0
+            arrow = _dir_arrow(direction, is_win)
+            pnl = t.get('pnl', 0)
+            pnl_str = f"{'+'if pnl>=0 else ''}${pnl:.2f}"
+            reason = 'TP' if t.get('closeReason') == 'TAKE_PROFIT' else 'SL'
+            line = f"{arrow} {entry_time} {pnl_str} ${entry:.0f} {reason} pk:${peak:+.1f}/lo:${low:+.1f}"
+            # Gray for closed
+            lines.append(f"<i>{line}</i>")
         else:
-            label = k.replace('_', ' ').upper()
-            val = f"{v:.3f}" if isinstance(v, float) else str(v)
-            lines.append(f"  {label}: {val}")
-    lines.append("━━━━━━━━━━━━━━━━━━━━━━━")
-    return "\n".join(lines)
+            # Active — compute unrealized
+            arrow = _dir_arrow(direction)
+            if live_price:
+                if direction == 'LONG':
+                    unr = (live_price - entry) * POSITION_OZ
+                else:
+                    unr = (entry - live_price) * POSITION_OZ
+                unr_str = f"{'+'if unr>=0 else ''}${unr:.2f}"
+            else:
+                unr_str = '---'
+            tp_dist = abs(tp - entry)
+            sl_dist = abs(sl - entry)
+            line = f"{arrow} {entry_time} {unr_str} ${entry:.0f} +${tp_dist:.1f}/-${sl_dist:.1f} pk:${peak:+.1f}/lo:${low:+.1f}"
+            # Green bold for active
+            lines.append(f"<b>{line}</b>")
+
+    return lines
+
+
+def _build_daily_footer(trades):
+    """Build footer line: overall profit, win rate, trade count."""
+    closed = [t for t in trades if t.get('status') == 'CLOSED']
+    open_count = sum(1 for t in trades if t.get('status') == 'OPEN')
+    total_pnl = sum(t.get('pnl', 0) for t in closed)
+    wins = sum(1 for t in closed if t.get('pnl', 0) > 0)
+    wr = (wins / len(closed) * 100) if closed else 0
+    pnl_icon = '📈' if total_pnl >= 0 else '📉'
+    return f"{pnl_icon} Day: <b>{'+'if total_pnl>=0 else ''}${total_pnl:.2f}</b> | WR: {wr:.0f}% ({wins}/{len(closed)}) | Open: {open_count}"
+
+
+def build_telegram_message(header: str, db, live_price=None) -> str:
+    """Build full Telegram message: header + daily trade list + footer."""
+    today_trades = _get_today_trades(db)
+    trade_lines = _build_trade_list(today_trades, live_price)
+    footer = _build_daily_footer(today_trades)
+
+    parts = [header, '']
+    if trade_lines:
+        parts.append('─── Today ───')
+        parts.extend(trade_lines)
+        parts.append('')
+    parts.append(footer)
+    return '\n'.join(parts)
+
+
+def build_snapshot(df_m1, df_m5, df_m5_shifted, db) -> MarketSnapshot:
+    """Build a MarketSnapshot from the current M1/M5 data.
+
+    Returns None if data is insufficient.
+    """
+    if len(df_m1) < 3:
+        return None
+
+    idx = -2  # Last completed candle
+    m1 = df_m1.iloc[idx]
+
+    # Check for NaN in critical M1 fields
+    if pd.isna(m1['rsi']) or pd.isna(m1['ema21']):
+        return None
+
+    # Find M5 values for this M1 timestamp
+    m1_time = df_m1.index[idx]
+    m5_idx = df_m5_shifted.index.searchsorted(m1_time) - 1
+    if m5_idx < 0 or m5_idx >= len(df_m5_shifted):
+        return None
+
+    m5 = df_m5_shifted.iloc[m5_idx]
+
+    # Check for NaN in critical M5 fields
+    if pd.isna(m5['atr']) or pd.isna(m5['ema9']) or pd.isna(m5['rsi']):
+        return None
+
+    # Slope lookback: 3 M5 candles back for trend detection
+    has_slope = False
+    m5_ema9_prev = None
+    m5_ema21_prev = None
+    if len(df_m5) >= 6:
+        m5_prev = df_m5.iloc[-4]  # 3 M5 candles back (15 min)
+        if not pd.isna(m5_prev['ema9']) and not pd.isna(m5_prev['ema21']):
+            has_slope = True
+            m5_ema9_prev = m5_prev['ema9']
+            m5_ema21_prev = m5_prev['ema21']
+
+    live_price = get_live_price(db) or m1['close']
+
+    return MarketSnapshot(
+        m1_close=m1['close'],
+        m1_high=m1['high'],
+        m1_low=m1['low'],
+        m1_rsi=m1['rsi'],
+        m1_ema21=m1['ema21'],
+        m1_upper_bb=m1['upper_bb'],
+        m1_lower_bb=m1['lower_bb'],
+        m1_bb_sma=m1['bb_sma'],
+        m1_atr=m1['atr'],
+        m5_atr=m5['atr'],
+        m5_ema9=m5['ema9'],
+        m5_ema21=m5['ema21'],
+        m5_ema50=m5['ema50'],
+        m5_rsi=m5['rsi'],
+        m5_close=m5['close'],
+        m5_upper_bb=m5['upper_bb'],
+        m5_lower_bb=m5['lower_bb'],
+        m5_volume=m5['volume'],
+        m5_vol_sma20=m5['vol_sma20'] if not pd.isna(m5['vol_sma20']) else 1,
+        m5_ema9_prev=m5_ema9_prev,
+        m5_ema21_prev=m5_ema21_prev,
+        has_slope_data=has_slope,
+        live_price=live_price,
+    )
 
 
 def run_strategies(db):
-    """Execute all 3 strategies with two-stage PREPARE → OPEN flow. Called every 5s."""
-    global last_ema_time, last_bb_time, last_inst_time
-
-    # (PREPARE logic removed — strategies enter OPEN directly)
-
+    """Execute all 3 strategies. Called every 5s."""
     df_m1 = load_candles(db, SYMBOL, 500)
     if df_m1 is None or len(df_m1) < 50:
         print(f"[Analyzer] Insufficient data: {len(df_m1) if df_m1 is not None else 0} M1 candles. Need 50+.")
@@ -207,216 +299,77 @@ def run_strategies(db):
         print(f"[Analyzer] Only {len(df_m5)} M5 candles. Need 20+.")
         return
 
-    # Attach indicators
+    # Attach indicators (from strategy.py)
     df_m1 = attach_indicators(df_m1)
     df_m5 = attach_indicators(df_m5)
 
-    # Shift M5 by 1 to prevent lookahead (use previously completed M5 candle)
+    # Shift M5 by 1 to prevent lookahead
     df_m5_shifted = df_m5.shift(1)
 
-    # Get current values from the LAST COMPLETED M1 candle (index -2)
-    if len(df_m1) < 3:
+    # Build snapshot
+    snap = build_snapshot(df_m1, df_m5, df_m5_shifted, db)
+    if snap is None:
         return
 
-    idx = -2  # Last completed candle
-    m1 = df_m1.iloc[idx]
-    m1_close = m1['close']
-    m1_high = m1['high']
-    m1_low = m1['low']
-    m1_rsi = m1['rsi']
-    m1_ema21 = m1['ema21']
-    m1_upper_bb = m1['upper_bb']
-    m1_lower_bb = m1['lower_bb']
-    m1_bb_sma = m1['bb_sma']
-    m1_atr = m1['atr']
+    # Log trend bias
+    if snap.has_slope_data:
+        from strategy import compute_trend_bias
+        bias = compute_trend_bias(
+            snap.m5_ema9, snap.m5_ema21, snap.m5_close,
+            snap.m5_ema9_prev, snap.m5_ema21_prev,
+        )
+        if bias != 'NEUTRAL':
+            print(f"[Trend Filter] M5 bias: {bias} | EMA9: {snap.m5_ema9:.2f} | EMA21: {snap.m5_ema21:.2f} | Close: {snap.m5_close:.2f}")
 
-    # Find the M5 values for this M1 timestamp
-    m1_time = df_m1.index[idx]
-    m5_idx = df_m5_shifted.index.searchsorted(m1_time) - 1
-    if m5_idx < 0 or m5_idx >= len(df_m5_shifted):
-        return
-
-    m5 = df_m5_shifted.iloc[m5_idx]
-
-    # Check for NaN
-    if pd.isna(m5['atr']) or pd.isna(m5['ema9']) or pd.isna(m1_rsi):
-        return
-
-    m5_atr = m5['atr']
-    m5_ema9 = m5['ema9']
-    m5_ema21 = m5['ema21']
-    m5_ema50 = m5['ema50']
-    m5_rsi = m5['rsi']
-    m5_vol = m5['volume']
-    m5_vol_sma = m5['vol_sma20'] if not pd.isna(m5['vol_sma20']) else 1
-    m5_close = m5['close']
-    m5_upper_bb = m5['upper_bb']
-    m5_lower_bb = m5['lower_bb']
-
-    # Global guard: M5 ATR must be alive
-    if m5_atr < 0.05:
-        return
-
+    # Evaluate strategies (from strategy.py — single source of truth)
     now = time.time()
-    live_price = get_live_price(db) or m1_close
+    signals = evaluate_strategies(snap, cooldowns, now, SPREAD_OFFSET)
 
-    # ==================== M5 TREND STRENGTH FILTER ====================
-    # Compute M5 EMA slope to detect strong directional trends.
-    # When the M5 trend is strongly one-directional, block ALL counter-trend entries
-    # (including mean reversion) to avoid "catching a falling knife."
-    m5_trend_bias = 'NEUTRAL'  # BULL_STRONG, BEAR_STRONG, or NEUTRAL
+    # Execute signals
+    for sig in signals:
+        trade_doc = {
+            'symbol': SYMBOL, 'direction': sig.direction, 'status': 'OPEN',
+            'entryPrice': round(sig.entry_price, 3),
+            'tp': round(sig.tp, 3), 'sl': round(sig.sl, 3),
+            'entryTime': int(now * 1000),
+            'signalType': sig.strategy, 'meta': sig.meta, 'lotSize': LOT_SIZE,
+        }
+        db.paper_trades.insert_one(trade_doc)
 
-    # Check if we have enough M5 history for slope calculation
-    if len(df_m5) >= 6:
-        m5_prev = df_m5.iloc[-4]  # 3 M5 candles back (15 min)
-        if not pd.isna(m5_prev['ema9']) and not pd.isna(m5_prev['ema21']):
-            ema9_slope = m5_ema9 - m5_prev['ema9']
-            ema21_slope = m5_ema21 - m5_prev['ema21']
+        # Build header: Arrow | Entry | TP - SL
+        arrow = '↑' if sig.direction == 'LONG' else '↓'
+        tp_dist = abs(sig.tp - sig.entry_price)
+        sl_dist = abs(sig.sl - sig.entry_price)
+        header = f"{arrow} <b>NEW {sig.direction} ${sig.entry_price:.2f} | TP +${tp_dist:.1f} SL -${sl_dist:.1f}</b> ({sig.strategy})"
 
-            # Strong bearish: EMAs falling, price below both, EMA9 < EMA21
-            if (ema9_slope < 0 and ema21_slope < 0 and
-                m5_close < m5_ema9 and m5_close < m5_ema21 and
-                m5_ema9 < m5_ema21):
-                m5_trend_bias = 'BEAR_STRONG'
+        live = get_live_price(db) or sig.entry_price
+        msg = build_telegram_message(header, db, live)
 
-            # Strong bullish: EMAs rising, price above both, EMA9 > EMA21
-            elif (ema9_slope > 0 and ema21_slope > 0 and
-                  m5_close > m5_ema9 and m5_close > m5_ema21 and
-                  m5_ema9 > m5_ema21):
-                m5_trend_bias = 'BULL_STRONG'
+        notify('TRADE_OPEN', None, msg, trade_doc)
+        print(f"[{sig.strategy}] {sig.direction} at {sig.entry_price:.3f} | TP: {sig.tp:.3f} | SL: {sig.sl:.3f}")
 
-    if m5_trend_bias != 'NEUTRAL':
-        print(f"[Trend Filter] M5 bias: {m5_trend_bias} | EMA9: {m5_ema9:.2f} | EMA21: {m5_ema21:.2f} | Close: {m5_close:.2f}")
-
-
-    def is_counter_trend(direction, signal_type):
-        """Return True if this direction fights the strong M5 trend."""
-        if m5_trend_bias == 'BEAR_STRONG' and direction == 'LONG':
-            print(f"[Trend Filter] Blocked {signal_type} LONG — M5 strongly bearish")
-            return True
-        if m5_trend_bias == 'BULL_STRONG' and direction == 'SHORT':
-            print(f"[Trend Filter] Blocked {signal_type} SHORT — M5 strongly bullish")
-            return True
-        return False
-
-    # ==================== STRATEGY A: EMA Trend Pullback ====================
-    if now - last_ema_time > COOLDOWN_SECS:
-        m5_bull = m5_ema9 > m5_ema21 > m5_ema50
-        m5_bear = m5_ema9 < m5_ema21 < m5_ema50
-
-        # --- FULL conditions (OPEN) ---
-        full_dir = None
-        if m5_bull and m1_low <= m1_ema21 and m1_rsi <= 45:
-            full_dir = 'LONG'
-        elif m5_bear and m1_high >= m1_ema21 and m1_rsi >= 55:
-            full_dir = 'SHORT'
-
-        if full_dir and not is_counter_trend(full_dir, 'EMA_PULLBACK'):
-            last_ema_time = now
-            tp_dist = m5_atr * 3.0
-            sl_dist = m5_atr * 1.2
-            tp = live_price + tp_dist if full_dir == 'LONG' else live_price - tp_dist
-            sl = live_price - sl_dist if full_dir == 'LONG' else live_price + sl_dist
-            meta = {
-                'rule': f"M5 EMA {'9>21>50 BULL' if m5_bull else '9<21<50 BEAR'}, M1 pullback to EMA21, M1 RSI reset",
-                'm1_rsi': round(m1_rsi, 2), 'm1_ema21': round(m1_ema21, 3),
-                'm5_ema9': round(m5_ema9, 3), 'm5_ema21': round(m5_ema21, 3),
-                'm5_ema50': round(m5_ema50, 3), 'm5_atr': round(m5_atr, 3),
-                'tp_mult': 3.0, 'sl_mult': 1.2,
-            }
-            trade_doc = {
-                'symbol': SYMBOL, 'direction': full_dir, 'status': 'OPEN',
-                'entryPrice': round(live_price, 3), 'tp': round(tp, 3), 'sl': round(sl, 3),
-                'entryTime': int(now * 1000),
-                'signalType': 'EMA_PULLBACK', 'meta': meta, 'lotSize': LOT_SIZE,
-            }
-            db.paper_trades.insert_one(trade_doc)
-            msg = format_trade_message('NEW ORDER', full_dir, live_price, tp, sl, 'EMA_PULLBACK', meta)
-            notify('TRADE_OPEN', f"📐 EMA Pullback {full_dir}", msg, trade_doc)
-            print(f"[Strategy A] {full_dir} at {live_price:.3f} | TP: {tp:.3f} | SL: {sl:.3f}")
-
-    # ==================== STRATEGY B: Bollinger Mean Reversion ====================
-    if now - last_bb_time > COOLDOWN_SECS:
-        full_dir = None
-        bb_trigger = ''
-        if m1_high > m1_upper_bb and m1_rsi >= 75:
-            full_dir = 'SHORT'
-            bb_trigger = f"M1 High ({m1_high:.3f}) > Upper BB ({m1_upper_bb:.3f}), RSI {m1_rsi:.1f} >= 75"
-        elif m1_low < m1_lower_bb and m1_rsi <= 25:
-            full_dir = 'LONG'
-            bb_trigger = f"M1 Low ({m1_low:.3f}) < Lower BB ({m1_lower_bb:.3f}), RSI {m1_rsi:.1f} <= 25"
-
-        if full_dir and not is_counter_trend(full_dir, 'BB_REVERSION'):
-            last_bb_time = now
-            tp_dist = m5_atr * 2.0
-            sl_dist = m5_atr * 1.5
-            tp = live_price + tp_dist if full_dir == 'LONG' else live_price - tp_dist
-            sl = live_price - sl_dist if full_dir == 'LONG' else live_price + sl_dist
-            meta = {
-                'rule': bb_trigger, 'm1_rsi': round(m1_rsi, 2),
-                'm1_upper_bb': round(m1_upper_bb, 3), 'm1_lower_bb': round(m1_lower_bb, 3),
-                'm5_atr': round(m5_atr, 3), 'tp_mult': 2.0, 'sl_mult': 1.5,
-            }
-            trade_doc = {
-                'symbol': SYMBOL, 'direction': full_dir, 'status': 'OPEN',
-                'entryPrice': round(live_price, 3), 'tp': round(tp, 3), 'sl': round(sl, 3),
-                'entryTime': int(now * 1000),
-                'signalType': 'BB_REVERSION', 'meta': meta, 'lotSize': LOT_SIZE,
-            }
-            db.paper_trades.insert_one(trade_doc)
-            msg = format_trade_message('NEW ORDER', full_dir, live_price, tp, sl, 'BB_REVERSION', meta)
-            notify('TRADE_OPEN', f"📊 BB Reversion {full_dir}", msg, trade_doc)
-            print(f"[Strategy B] {full_dir} at {live_price:.3f} | TP: {tp:.3f} | SL: {sl:.3f}")
-
-    # ==================== STRATEGY C: Institutional Breakout ====================
-    if now - last_inst_time > COOLDOWN_SECS:
-        vol_ratio = (m5_vol / m5_vol_sma) if m5_vol_sma > 0 else 0
-
-        full_dir = None
-        if vol_ratio > 2.0:
-            if m5_close > m5_upper_bb and m1_low <= m5_ema9:
-                full_dir = 'LONG'
-            elif m5_close < m5_lower_bb and m1_high >= m5_ema9:
-                full_dir = 'SHORT'
-
-        if full_dir and not is_counter_trend(full_dir, 'INST_BREAKOUT'):
-            last_inst_time = now
-            tp_dist = m5_atr * 4.0
-            sl_dist = m5_atr * 1.0
-            tp = live_price + tp_dist if full_dir == 'LONG' else live_price - tp_dist
-            sl = live_price - sl_dist if full_dir == 'LONG' else live_price + sl_dist
-            meta = {
-                'rule': f"M5 Vol surge ({vol_ratio:.1f}x > 2.0x), M5 close {'above Upper BB' if full_dir == 'LONG' else 'below Lower BB'}, M1 pullback to M5 EMA9",
-                'm5_volume': round(m5_vol, 0), 'm5_vol_ratio': round(vol_ratio, 2),
-                'm5_close': round(m5_close, 3), 'm5_ema9': round(m5_ema9, 3),
-                'm5_atr': round(m5_atr, 3), 'tp_mult': 4.0, 'sl_mult': 1.0,
-            }
-            trade_doc = {
-                'symbol': SYMBOL, 'direction': full_dir, 'status': 'OPEN',
-                'entryPrice': round(live_price, 3), 'tp': round(tp, 3), 'sl': round(sl, 3),
-                'entryTime': int(now * 1000),
-                'signalType': 'INST_BREAKOUT', 'meta': meta, 'lotSize': LOT_SIZE,
-            }
-            db.paper_trades.insert_one(trade_doc)
-            msg = format_trade_message('NEW ORDER', full_dir, live_price, tp, sl, 'INST_BREAKOUT', meta)
-            notify('TRADE_OPEN', f"🏦 Inst. Breakout {full_dir}", msg, trade_doc)
-            print(f"[Strategy C] {full_dir} at {live_price:.3f} | TP: {tp:.3f} | SL: {sl:.3f}")
 
 # ===================== REAL-TIME BROADCAST =====================
 
 def get_frontend_payload(db):
-    """Generate the full data payload for the frontend (trades, livePrice, indicators)."""
-    trades = list(db.paper_trades.find().sort('entryTime', -1).limit(200))
+    """Generate the full data payload for the frontend — today's trades only."""
+    from datetime import datetime as dt, timezone as tz, timedelta
+    ict = tz(timedelta(hours=7))
+    now = dt.now(ict)
+    start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_ms = int(start_of_day.timestamp() * 1000)
+
+    trades = list(db.paper_trades.find(
+        {'entryTime': {'$gte': start_ms}}
+    ).sort('entryTime', -1))
     for t in trades:
         t['_id'] = str(t['_id'])
-        # Convert any remaining ObjectId/datetime fields
         for k, v in t.items():
             if hasattr(v, '__str__') and type(v).__name__ in ('ObjectId', 'datetime'):
                 t[k] = str(v)
-                
+
     live = get_live_price(db)
-    
-    # Compute current indicators for live display
+
     indicators = {}
     df_m1 = load_candles(db, SYMBOL, 100)
     if df_m1 is not None and len(df_m1) >= 20:
@@ -445,14 +398,13 @@ def get_frontend_payload(db):
     }
 
 def broadcast_trades(db):
-    """Broadcast the full trade state via notification WS for real-time frontend updates."""
+    """Broadcast the full trade state via notification WS."""
     try:
         payload = get_frontend_payload(db)
         payload['type'] = 'TRADES_UPDATE'
-
         requests.post(NOTIFICATION_URL, json=payload, timeout=2)
     except Exception:
-        pass  # Non-critical — frontend falls back to polling
+        pass
 
 
 # ===================== TP/SL MONITOR =====================
@@ -479,15 +431,13 @@ def monitor_trades(db):
                 close_reason = 'TAKE_PROFIT'
             elif live_price <= sl:
                 close_reason = 'STOP_LOSS'
-        else:  # SHORT
+        else:
             if live_price <= tp:
                 close_reason = 'TAKE_PROFIT'
             elif live_price >= sl:
                 close_reason = 'STOP_LOSS'
 
         if close_reason:
-
-            # Correct PnL
             if direction == 'LONG':
                 pnl = (live_price - entry) * POSITION_OZ
             else:
@@ -504,27 +454,18 @@ def monitor_trades(db):
                 }}
             )
 
-            # Get overall stats
-            all_closed = list(db.paper_trades.find({'status': 'CLOSED'}))
-            total_pnl = sum(t.get('pnl', 0) for t in all_closed)
-            wins = sum(1 for t in all_closed if t.get('pnl', 0) > 0)
-            wr = (wins / len(all_closed) * 100) if all_closed else 0
-
-            emoji = '✅' if close_reason == 'TAKE_PROFIT' else '❌'
             strat = trade.get('signalType', '?')
             hold_mins = (time.time() * 1000 - trade.get('entryTime', 0)) / 60000
 
-            msg = (
-                f"{emoji} <b>ORDER CLOSED | {direction} | {close_reason}</b>\n"
-                f"Strategy: <b>{strat}</b>\n"
-                f"Entry: ${entry:.2f} → Exit: ${live_price:.2f}\n"
-                f"PnL: <b>{'+'if pnl>0 else ''}${pnl:.2f}</b> (0.01 lot)\n"
-                f"Hold: {hold_mins:.0f} min\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"📊 Overall: ${total_pnl:.2f} | WR: {wr:.1f}% | Trades: {len(all_closed)}"
-            )
-            notify('TRADE_CLOSE', f"{emoji} {strat} {close_reason}", msg)
-            print(f"[Monitor] {emoji} {direction} {close_reason} | Entry: {entry:.2f} | Exit: {live_price:.2f} | PnL: ${pnl:.2f}")
+            # Build header: colored arrow for TP/SL | amount | entry | hold time
+            is_tp = close_reason == 'TAKE_PROFIT'
+            arrow_icon = _dir_arrow(direction, is_win=is_tp)
+            pnl_str = f"{'+'if pnl>=0 else ''}${pnl:.2f}"
+            header = f"{arrow_icon} <b>CLOSED {pnl_str} | ${entry:.2f} → ${live_price:.2f} | {hold_mins:.0f}m</b> ({strat})"
+
+            msg = build_telegram_message(header, db, live_price)
+            notify('TRADE_CLOSE', None, msg)
+            print(f"[Monitor] {'✅' if is_tp else '❌'} {direction} {close_reason} | Entry: {entry:.2f} | Exit: {live_price:.2f} | PnL: ${pnl:.2f}")
 
     # Update peak profit/loss for open trades
     for trade in open_trades:
@@ -549,14 +490,14 @@ def monitor_trades(db):
 # ===================== REST API =====================
 
 def start_api(db):
-    """Start the Express-like REST API using Flask-style threading."""
+    """Start the REST API."""
     from http.server import HTTPServer, BaseHTTPRequestHandler
     import json as json_mod
     from urllib.parse import urlparse, parse_qs
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format, *args):
-            pass  # Suppress noisy logs
+            pass
 
         def _send_json(self, data, status=200):
             self.send_response(status)
@@ -585,12 +526,17 @@ def start_api(db):
                 self._send_json(payload)
 
             elif parsed.path == '/api/paper-trades/stats':
-                closed = list(db.paper_trades.find({'status': 'CLOSED'}))
+                from datetime import datetime as dt, timezone as tz, timedelta
+                ict = tz(timedelta(hours=7))
+                now = dt.now(ict)
+                start_ms = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
+                today_filter = {'entryTime': {'$gte': start_ms}}
+                closed = list(db.paper_trades.find({**today_filter, 'status': 'CLOSED'}))
                 wins = sum(1 for t in closed if t.get('pnl', 0) > 0)
                 losses = sum(1 for t in closed if t.get('pnl', 0) < 0)
                 total_pnl = sum(t.get('pnl', 0) for t in closed)
                 wr = (wins / len(closed) * 100) if closed else 0
-                open_count = db.paper_trades.count_documents({'status': 'OPEN'})
+                open_count = db.paper_trades.count_documents({**today_filter, 'status': 'OPEN'})
                 self._send_json({
                     'wins': wins, 'losses': losses, 'totalPnl': round(total_pnl, 2),
                     'winRate': round(wr, 1), 'openTrades': open_count, 'totalTrades': len(closed)
@@ -642,23 +588,20 @@ def main():
     # Main loop
     last_strategy_run = 0
     last_heartbeat = 0
-    STRATEGY_INTERVAL = 5  # Run strategies every 5 seconds
-    HEARTBEAT_INTERVAL = 30  # Status print every 30s
+    STRATEGY_INTERVAL = 5
+    HEARTBEAT_INTERVAL = 30
 
     while True:
         try:
             now = time.time()
 
-            # Monitor TP/SL every second, then broadcast state
             monitor_trades(db)
             broadcast_trades(db)
 
-            # Run strategies every 5 seconds
             if now - last_strategy_run >= STRATEGY_INTERVAL:
                 last_strategy_run = now
                 run_strategies(db)
 
-            # Heartbeat: confirm analyzer is alive
             if now - last_heartbeat >= HEARTBEAT_INTERVAL:
                 last_heartbeat = now
                 live = get_live_price(db)
