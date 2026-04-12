@@ -121,6 +121,7 @@ k8s-deploy: k8s-build
 prod-up:
 	@echo "Starting production stack (Docker Compose)..."
 	docker compose -f docker-compose.prod.yml up -d --build
+	@$(MAKE) _notify-deploy MSG="Local Docker"
 
 prod-down:
 	@echo "Stopping production stack..."
@@ -162,5 +163,22 @@ endif
 	scp -o StrictHostKeyChecking=no .env docker-compose.prod.yml ubuntu@$(IP):/home/ubuntu/trading/
 	@echo "🔄 Pulling latest code & restarting services on VM..."
 	ssh -o StrictHostKeyChecking=no ubuntu@$(IP) "cd /home/ubuntu/trading && git pull origin main 2>/dev/null; docker compose -f docker-compose.prod.yml up -d --build"
+	@$(MAKE) _notify-deploy MSG="OCI VM $(IP)"
 	@echo "✅ Done! Services running with production secrets."
 	@echo "   View logs: ssh ubuntu@$(IP) 'cd /home/ubuntu/trading && docker compose -f docker-compose.prod.yml logs -f'"
+
+# ===================== DEPLOY NOTIFICATION =====================
+
+_notify-deploy:
+	@bash -c '\
+		set -a; source .env; set +a; \
+		COMMIT=$$(git log -1 --format="%h %s" 2>/dev/null || echo "unknown"); \
+		TIME=$$(date "+%Y-%m-%d %H:%M:%S"); \
+		TEXT="🚀 <b>Deploy Complete</b>%0A%0A📍 $${MSG:-Production}%0A🔖 $${COMMIT}%0A🕐 $${TIME}"; \
+		curl -s "https://api.telegram.org/bot$${TELEGRAM_BOT_TOKEN}/sendMessage" \
+			-d chat_id="$${TELEGRAM_CHAT_ID}" \
+			-d parse_mode=HTML \
+			-d text="$${TEXT}" > /dev/null 2>&1 \
+		&& echo "📨 Deploy notification sent to Telegram" \
+		|| echo "⚠️  Telegram notification failed (check .env credentials)"\
+	'
