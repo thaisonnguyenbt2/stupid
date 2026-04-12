@@ -54,7 +54,7 @@ runcmd:
 
   # Clone the Git Repository
   - cd /home/ubuntu
-  - git clone https://github.com/thaisonnguyenbt2/exness.git trading
+  - git clone https://github.com/thaisonnguyenbt2/stupid.git trading
   - chown -R ubuntu:ubuntu trading
 
   # Copy .env with production secrets (must be edited after first boot)

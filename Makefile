@@ -56,11 +56,15 @@ db-down:
 # All dry-run commands use the SAME strategy.py as the live analyzer.
 # This guarantees parity between backtest and production.
 #
+# Context timeframe (default M5):
+#   make dry-run DS=202603 TF=15min
+#   make dry-run-all TF=15min
+#   make dry-run-mongo TF=15min
+#
+# TF options: 5min (default), 15min, 30min, 1h
+#
 # Run against a specific dataset (202601, 202602, 202603):
 #   make dry-run DS=202603
-#
-# Run against a specific CSV file:
-#   make dry-run DS=data/DAT_ASCII_XAUUSD_T_202603.csv
 #
 # Run all available datasets:
 #   make dry-run-all
@@ -71,26 +75,28 @@ db-down:
 # Run against MongoDB paper trading data:
 #   make dry-run-mongo
 
+TF ?= 5min
+
 dry-run:
 ifndef DS
 	@echo "Usage: make dry-run DS=202603"
-	@echo "       make dry-run DS=data/DAT_ASCII_XAUUSD_T_202603.csv"
+	@echo "       make dry-run DS=202603 TF=15min"
 	@exit 1
 endif
-	@echo "[Dry Run] Running backtest against $(DS)..."
-	bash -c 'cd services/analyzer && source venv/bin/activate && python dry_run.py --csv "$(DS)"'
+	@echo "[Dry Run] Running backtest against $(DS) (context: $(TF))..."
+	bash -c 'cd services/analyzer && source venv/bin/activate && python dry_run.py --csv "$(DS)" --context-tf "$(TF)"'
 
 dry-run-all:
-	@echo "[Dry Run] Running backtest against ALL datasets..."
-	bash -c 'cd services/analyzer && source venv/bin/activate && python dry_run.py --csv all'
+	@echo "[Dry Run] Running backtest against ALL datasets (context: $(TF))..."
+	bash -c 'cd services/analyzer && source venv/bin/activate && python dry_run.py --csv all --context-tf "$(TF)"'
 
 dry-run-compare:
-	@echo "[Dry Run] Comparing WITH vs WITHOUT trend filter..."
-	bash -c 'cd services/analyzer && source venv/bin/activate && python dry_run.py --csv compare'
+	@echo "[Dry Run] Comparing WITH vs WITHOUT trend filter (context: $(TF))..."
+	bash -c 'cd services/analyzer && source venv/bin/activate && python dry_run.py --csv compare --context-tf "$(TF)"'
 
 dry-run-mongo:
-	@echo "[Dry Run] Running backtest against MongoDB paper trading data..."
-	bash -c 'cd services/analyzer && source venv/bin/activate && python dry_run.py --mongo'
+	@echo "[Dry Run] Running backtest against MongoDB (context: $(TF))..."
+	bash -c 'cd services/analyzer && source venv/bin/activate && python dry_run.py --mongo --context-tf "$(TF)"'
 
 chart:
 	@echo "[Chart] Serving Dry Run Visualization at http://localhost:8000"
@@ -152,9 +158,9 @@ ocl-setup:
 ifndef IP
 	$(error Usage: make ocl-setup IP=<vm_public_ip>)
 endif
-	@echo "📦 Uploading .env to VM $(IP)..."
-	scp -o StrictHostKeyChecking=no .env ubuntu@$(IP):/home/ubuntu/trading/.env
-	@echo "🔄 Restarting services on VM..."
-	ssh -o StrictHostKeyChecking=no ubuntu@$(IP) "cd /home/ubuntu/trading && docker compose -f docker-compose.prod.yml restart"
+	@echo "📦 Uploading .env + docker-compose.prod.yml to VM $(IP)..."
+	scp -o StrictHostKeyChecking=no .env docker-compose.prod.yml ubuntu@$(IP):/home/ubuntu/trading/
+	@echo "🔄 Pulling latest code & restarting services on VM..."
+	ssh -o StrictHostKeyChecking=no ubuntu@$(IP) "cd /home/ubuntu/trading && git pull origin main 2>/dev/null; docker compose -f docker-compose.prod.yml up -d --build"
 	@echo "✅ Done! Services running with production secrets."
 	@echo "   View logs: ssh ubuntu@$(IP) 'cd /home/ubuntu/trading && docker compose -f docker-compose.prod.yml logs -f'"

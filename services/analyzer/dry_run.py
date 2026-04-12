@@ -25,7 +25,7 @@ from dotenv import load_dotenv
 
 # Import the single source of truth
 from strategy import (
-    attach_indicators, resample_m5, evaluate_strategies,
+    attach_indicators, resample_m5, resample_ohlcv, evaluate_strategies,
     MarketSnapshot, CooldownState, POSITION_OZ, COOLDOWN_SECS,
 )
 
@@ -36,8 +36,8 @@ DATA_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'data')
 
 # ===================== DATA LOADING =====================
 
-def load_from_csv(csv_path):
-    """Load tick-level CSV, resample to M1/M5, cache as pickle."""
+def load_from_csv(csv_path, context_tf='5min'):
+    """Load tick-level CSV, resample to M1 and context TF, cache M1 as pickle."""
     dataset_id = None
     for tag in ['202601', '202602', '202603']:
         if tag in csv_path:
@@ -47,12 +47,10 @@ def load_from_csv(csv_path):
         dataset_id = os.path.splitext(os.path.basename(csv_path))[0]
 
     m1_path = os.path.join(DATA_DIR, f'xau_m1_cache_{dataset_id}.pkl')
-    m5_path = os.path.join(DATA_DIR, f'xau_m5_cache_{dataset_id}.pkl')
 
-    if os.path.exists(m1_path) and os.path.exists(m5_path):
-        print(f"Loading cached M1/M5 from {m1_path}...")
+    if os.path.exists(m1_path):
+        print(f"Loading cached M1 from {m1_path}...")
         df_m1 = pd.read_pickle(m1_path)
-        df_m5 = pd.read_pickle(m5_path)
     else:
         if not os.path.exists(csv_path):
             print(f"Error: {csv_path} not found.")
@@ -68,27 +66,26 @@ def load_from_csv(csv_path):
         df_tick.sort_index(inplace=True)
         print(f"Parsed {len(df_tick)} ticks in {time.time() - start:.1f}s. Resampling...")
 
-        def agg_tf(freq):
-            df_agg = df_tick.resample(freq).agg({
-                'price': ['first', 'max', 'min', 'last'],
-                'volume': 'sum'
-            })
-            df_agg.columns = ['open', 'high', 'low', 'close', 'volume']
-            df_agg.dropna(inplace=True)
-            return df_agg
-
-        df_m1 = agg_tf('1min')
-        df_m5 = agg_tf('5min')
+        df_m1 = df_tick.resample('1min').agg({
+            'price': ['first', 'max', 'min', 'last'],
+            'volume': 'sum'
+        })
+        df_m1.columns = ['open', 'high', 'low', 'close', 'volume']
+        df_m1.dropna(inplace=True)
 
         df_m1.to_pickle(m1_path)
-        df_m5.to_pickle(m5_path)
-        print("Cached.")
+        print("Cached M1.")
 
-    return df_m1, df_m5, dataset_id
+    # Resample to the requested context timeframe
+    df_ctx = resample_ohlcv(df_m1, context_tf)
+    tf_label = context_tf.upper().replace('MIN', 'M').replace('H', 'H')
+    print(f"Context TF: {tf_label} ({len(df_ctx)} bars)")
+
+    return df_m1, df_ctx, dataset_id
 
 
-def load_from_mongo():
-    """Load M1 candles from MongoDB, resample to M5."""
+def load_from_mongo(context_tf='5min'):
+    """Load M1 candles from MongoDB, resample to context TF."""
     from pymongo import MongoClient
 
     mongo_uri = os.getenv('MONGODB_URI', 'mongodb://localhost:27017/trading')
@@ -114,12 +111,12 @@ def load_from_mongo():
         df_m1['volume'] = df_m1['tickVolume'].where(df_m1['tickVolume'] > 0, df_m1.get('volume', 1))
     df_m1['volume'] = df_m1['volume'].fillna(1).replace(0, 1)
 
-    df_m5 = resample_m5(df_m1)
+    df_ctx = resample_ohlcv(df_m1, context_tf)
 
     # Also pull actual paper trades for comparison
     actual_trades = list(db.paper_trades.find({'status': 'CLOSED'}).sort('entryTime', 1))
 
-    return df_m1, df_m5, 'mongo', actual_trades
+    return df_m1, df_ctx, 'mongo', actual_trades
 
 
 # ===================== SNAPSHOT BUILDER =====================
@@ -180,15 +177,24 @@ def build_snapshot_for_bar(df_m1, df_m5, df_m5_shifted, i, m5_idx):
 
 # ===================== CORE DRY-RUN =====================
 
-def run_dry_run(df_m1, df_m5, dataset_id, trend_filter=True, spread_offset=0.0):
-    """Run the strategy engine over historical M1/M5 data.
+def run_dry_run(df_m1, df_ctx, dataset_id, trend_filter=True, spread_offset=0.0, context_tf='5min'):
+    """Run the strategy engine over historical M1 + context TF data.
+
+    Args:
+        df_m1: M1 OHLCV DataFrame
+        df_ctx: Context timeframe OHLCV DataFrame (M5, M15, etc.)
+        dataset_id: Label for reporting
+        context_tf: Label string for the context timeframe
 
     Returns (total_pnl, win_rate, trade_count, final_trades) or None.
     """
+    tf_label = context_tf.upper().replace('MIN', 'M').replace('H', 'H')
+    # Keep variable name df_m5 internally for snapshot builder compatibility
+    df_m5 = df_ctx
     print(f"\n{'='*60}")
-    print(f"  Dataset: {dataset_id}")
+    print(f"  Dataset: {dataset_id} | Context: {tf_label}")
     print(f"{'='*60}")
-    print(f"Data: M1({len(df_m1)} rows), M5({len(df_m5)} rows)")
+    print(f"Data: M1({len(df_m1)} rows), {tf_label}({len(df_m5)} rows)")
 
     print("Computing indicators...")
     df_m1 = attach_indicators(df_m1)
@@ -393,7 +399,7 @@ def export_json(df_m1, final_trades, dataset_id):
 
 # ===================== ENTRY POINTS =====================
 
-def run_csv_mode(csv_arg, trend_filter=True):
+def run_csv_mode(csv_arg, trend_filter=True, context_tf='5min'):
     """Run against CSV tick data files."""
     DATASETS = {
         '202601': os.path.join(DATA_DIR, 'DAT_ASCII_XAUUSD_T_202601.csv'),
@@ -404,9 +410,9 @@ def run_csv_mode(csv_arg, trend_filter=True):
     if csv_arg == 'all':
         summary = []
         for ds_id, path in DATASETS.items():
-            df_m1, df_m5, dataset_id = load_from_csv(path)
+            df_m1, df_ctx, dataset_id = load_from_csv(path, context_tf)
             if df_m1 is not None:
-                result = run_dry_run(df_m1, df_m5, dataset_id, trend_filter)
+                result = run_dry_run(df_m1, df_ctx, dataset_id, trend_filter, context_tf=context_tf)
                 if result:
                     pnl, wr, count, trades = result
                     summary.append((dataset_id, pnl, wr, count))
@@ -430,9 +436,9 @@ def run_csv_mode(csv_arg, trend_filter=True):
         print("=" * 80)
         no_filter = []
         for ds_id in datasets:
-            df_m1, df_m5, did = load_from_csv(DATASETS[ds_id])
+            df_m1, df_ctx, did = load_from_csv(DATASETS[ds_id], context_tf)
             if df_m1 is not None:
-                result = run_dry_run(df_m1, df_m5, did, trend_filter=False)
+                result = run_dry_run(df_m1, df_ctx, did, trend_filter=False, context_tf=context_tf)
                 if result: no_filter.append((did, result[0], result[1], result[2]))
 
         print("\n" + "=" * 80)
@@ -440,9 +446,9 @@ def run_csv_mode(csv_arg, trend_filter=True):
         print("=" * 80)
         with_filter = []
         for ds_id in datasets:
-            df_m1, df_m5, did = load_from_csv(DATASETS[ds_id])
+            df_m1, df_ctx, did = load_from_csv(DATASETS[ds_id], context_tf)
             if df_m1 is not None:
-                result = run_dry_run(df_m1, df_m5, did, trend_filter=True)
+                result = run_dry_run(df_m1, df_ctx, did, trend_filter=True, context_tf=context_tf)
                 if result: with_filter.append((did, result[0], result[1], result[2]))
 
         # Build comparison table
@@ -474,19 +480,19 @@ def run_csv_mode(csv_arg, trend_filter=True):
             csv_path = DATASETS[csv_arg]
         else:
             csv_path = csv_arg
-        df_m1, df_m5, dataset_id = load_from_csv(csv_path)
+        df_m1, df_ctx, dataset_id = load_from_csv(csv_path, context_tf)
         if df_m1 is not None:
-            result = run_dry_run(df_m1, df_m5, dataset_id, trend_filter)
+            result = run_dry_run(df_m1, df_ctx, dataset_id, trend_filter, context_tf=context_tf)
             if result:
                 export_json(df_m1, result[3], dataset_id)
 
 
-def run_mongo_mode():
+def run_mongo_mode(context_tf='5min'):
     """Run against MongoDB paper trading candles."""
-    result = load_from_mongo()
+    result = load_from_mongo(context_tf)
     if result is None:
         return
-    df_m1, df_m5, dataset_id, actual_trades = result
+    df_m1, df_ctx, dataset_id, actual_trades = result
 
     if df_m1 is None:
         return
@@ -494,8 +500,9 @@ def run_mongo_mode():
     print(f"  Loaded {len(df_m1)} M1 candles from MongoDB")
     print(f"  Range: {df_m1.index[0]} → {df_m1.index[-1]}")
 
-    result = run_dry_run(df_m1, df_m5, dataset_id, trend_filter=True,
-                         spread_offset=float(os.getenv('SPREAD_OFFSET', '0.0')))
+    result = run_dry_run(df_m1, df_ctx, dataset_id, trend_filter=True,
+                         spread_offset=float(os.getenv('SPREAD_OFFSET', '0.0')),
+                         context_tf=context_tf)
 
     if result is None:
         return
@@ -539,7 +546,9 @@ def main():
     parser = argparse.ArgumentParser(description='XAU/USD Strategy Dry-Run')
     parser.add_argument('--csv', type=str, help='CSV file path, dataset ID (202601/202602/202603), "all", or "compare"')
     parser.add_argument('--mongo', action='store_true', help='Run against MongoDB paper trading data')
-    parser.add_argument('--no-trend-filter', action='store_true', help='Disable M5 trend filter')
+    parser.add_argument('--no-trend-filter', action='store_true', help='Disable trend filter')
+    parser.add_argument('--context-tf', type=str, default='5min',
+                        help='Context timeframe: 5min (default), 15min, 30min, 1h')
 
     args = parser.parse_args()
 
@@ -547,16 +556,17 @@ def main():
         parser.print_help()
         print("\nExamples:")
         print("  python dry_run.py --csv 202603")
-        print("  python dry_run.py --csv all")
+        print("  python dry_run.py --csv 202603 --context-tf 15min")
+        print("  python dry_run.py --csv all --context-tf 15min")
         print("  python dry_run.py --csv compare")
-        print("  python dry_run.py --csv ../../data/DAT_ASCII_XAUUSD_T_202603.csv")
         print("  python dry_run.py --mongo")
+        print("  python dry_run.py --mongo --context-tf 15min")
         return
 
     if args.csv:
-        run_csv_mode(args.csv, trend_filter=not args.no_trend_filter)
+        run_csv_mode(args.csv, trend_filter=not args.no_trend_filter, context_tf=args.context_tf)
     elif args.mongo:
-        run_mongo_mode()
+        run_mongo_mode(context_tf=args.context_tf)
 
 
 if __name__ == '__main__':

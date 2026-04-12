@@ -154,17 +154,27 @@ def attach_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def resample_m5(df_m1: pd.DataFrame) -> pd.DataFrame:
-    """Resample M1 candles to M5 with volume sum."""
-    df_m5 = df_m1.resample('5min').agg({
+def resample_ohlcv(df: pd.DataFrame, freq: str = '5min') -> pd.DataFrame:
+    """Resample OHLCV data to a higher timeframe.
+
+    Args:
+        df: Source DataFrame with OHLCV columns and DatetimeIndex
+        freq: Pandas frequency string (e.g. '5min', '15min', '30min', '1h')
+    """
+    df_out = df.resample(freq).agg({
         'open': 'first',
         'high': 'max',
         'low': 'min',
         'close': 'last',
         'volume': 'sum'
     })
-    df_m5.dropna(inplace=True)
-    return df_m5
+    df_out.dropna(inplace=True)
+    return df_out
+
+
+def resample_m5(df_m1: pd.DataFrame) -> pd.DataFrame:
+    """Convenience alias: resample M1 → M5."""
+    return resample_ohlcv(df_m1, '5min')
 
 
 # ===================== TREND FILTER =====================
