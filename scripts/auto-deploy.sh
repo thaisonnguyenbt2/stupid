@@ -41,3 +41,19 @@ docker compose -f "$COMPOSE_FILE" up -d --remove-orphans 2>&1 | tee -a "$LOG_FIL
 docker image prune -f --filter "until=1h" >/dev/null 2>&1 || true
 
 log "✅ Deploy complete: $(git rev-parse --short HEAD)"
+
+# Send Telegram notification
+if [ -f "$REPO_DIR/.env" ]; then
+  set -a; source "$REPO_DIR/.env"; set +a
+  if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
+    COMMIT=$(git log -1 --format="%h %s")
+    TIME=$(date "+%Y-%m-%d %H:%M:%S")
+    TEXT="🚀 <b>Auto-Deploy Complete</b>%0A%0A📍 OCI VM (auto)%0A🔖 ${COMMIT}%0A🕐 ${TIME}"
+    curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+      -d chat_id="${TELEGRAM_CHAT_ID}" \
+      -d parse_mode=HTML \
+      -d text="${TEXT}" > /dev/null 2>&1 \
+      && log "📨 Telegram notification sent" \
+      || log "⚠️ Telegram notification failed"
+  fi
+fi
