@@ -204,7 +204,7 @@ def _build_daily_footer(trades):
     wins = sum(1 for t in closed if t.get('pnl', 0) > 0)
     wr = (wins / len(closed) * 100) if closed else 0
     pnl_icon = '📈' if total_pnl >= 0 else '📉'
-    return f"{pnl_icon} Day: <b>{'+'if total_pnl>=0 else ''}${total_pnl:.2f}</b> | WR: {wr:.0f}% ({wins}/{len(closed)}) | Open: {open_count}"
+    return f"{pnl_icon} Day: <b>{'+'if total_pnl>=0 else ''}${total_pnl:.2f}</b> | WR: {wr:.0f}% ({wins}/{len(closed)}) | Trades: {len(trades)}"
 
 
 def build_telegram_message(header: str, db, live_price=None) -> str:
