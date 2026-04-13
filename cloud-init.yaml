@@ -85,7 +85,7 @@ runcmd:
 
     [Timer]
     OnBootSec=120
-    OnUnitActiveSec=300
+    OnUnitActiveSec=60
     Persistent=true
 
     [Install]

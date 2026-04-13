@@ -223,13 +223,25 @@ def build_telegram_message(header: str, db, live_price=None) -> str:
 def build_snapshot(df_m1, df_m5, df_m5_shifted, db) -> MarketSnapshot:
     """Build a MarketSnapshot from the current M1/M5 data.
 
+    Uses the LIVE (partial) M1 bar with live tick price injected for
+    minimum latency. M5 indicators use completed shifted bars for stability.
+
     Returns None if data is insufficient.
     """
     if len(df_m1) < 3:
         return None
 
-    idx = -2  # Last completed candle
-    m1 = df_m1.iloc[idx]
+    live_price = get_live_price(db)
+
+    # Use bar -1 (current live partial candle) with live tick injected
+    idx = -1
+    m1 = df_m1.iloc[idx].copy()
+
+    # Inject live tick price into the partial bar for freshest data
+    if live_price:
+        m1['close'] = live_price
+        m1['high'] = max(m1['high'], live_price)
+        m1['low'] = min(m1['low'], live_price)
 
     # Check for NaN in critical M1 fields
     if pd.isna(m1['rsi']) or pd.isna(m1['ema21']):
@@ -258,7 +270,7 @@ def build_snapshot(df_m1, df_m5, df_m5_shifted, db) -> MarketSnapshot:
             m5_ema9_prev = m5_prev['ema9']
             m5_ema21_prev = m5_prev['ema21']
 
-    live_price = get_live_price(db) or m1['close']
+    entry = live_price or m1['close']
 
     return MarketSnapshot(
         m1_close=m1['close'],
@@ -283,7 +295,7 @@ def build_snapshot(df_m1, df_m5, df_m5_shifted, db) -> MarketSnapshot:
         m5_ema9_prev=m5_ema9_prev,
         m5_ema21_prev=m5_ema21_prev,
         has_slope_data=has_slope,
-        live_price=live_price,
+        live_price=entry,
     )
 
 
