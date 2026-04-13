@@ -23,3 +23,5 @@ venv/
 
 # macOS
 .DS_Store
+frontend/.env.local
+k8s/app/secret-env.yaml

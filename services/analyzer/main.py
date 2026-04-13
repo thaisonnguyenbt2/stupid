@@ -33,7 +33,7 @@ from dotenv import load_dotenv
 
 from strategy import (
     calc_ema, calc_rsi, calc_atr,
-    attach_indicators, resample_m5,
+    attach_indicators, resample_m5, resample_ohlcv,
     evaluate_strategies,
     MarketSnapshot, Signal, CooldownState,
     LOT_SIZE, CONTRACT_SIZE, POSITION_OZ, COOLDOWN_SECS,
@@ -48,8 +48,10 @@ ANALYZER_PORT = int(os.getenv('ANALYZER_PORT', '4002'))
 NOTIFICATION_URL = os.getenv('NOTIFICATION_URL', f"http://localhost:{os.getenv('NOTIFICATION_PORT', '4003')}/api/notify")
 SPREAD_OFFSET = float(os.getenv('SPREAD_OFFSET', '0.0'))
 
-# Cooldown state (persists across strategy runs)
-cooldowns = CooldownState()
+# Cooldown state per context timeframe (each TF trades independently)
+# Backtested: M5 +$48, M10 +$65, M15 +$7, M30 -$769
+CONTEXT_TIMEFRAMES = ['5min', '10min', '15min']
+cooldowns_per_tf = {tf: CooldownState() for tf in CONTEXT_TIMEFRAMES}
 
 
 # ===================== NOTIFICATION HELPER =====================
@@ -300,65 +302,60 @@ def build_snapshot(df_m1, df_m5, df_m5_shifted, db) -> MarketSnapshot:
 
 
 def run_strategies(db):
-    """Execute all 3 strategies. Called every 5s."""
+    """Execute all strategies across all context timeframes. Called every 5s."""
     df_m1 = load_candles(db, SYMBOL, 500)
     if df_m1 is None or len(df_m1) < 50:
         print(f"[Analyzer] Insufficient data: {len(df_m1) if df_m1 is not None else 0} M1 candles. Need 50+.")
         return
 
-    df_m5 = resample_m5(df_m1)
-    if len(df_m5) < 20:
-        print(f"[Analyzer] Only {len(df_m5)} M5 candles. Need 20+.")
-        return
-
-    # Attach indicators (from strategy.py)
+    # Compute M1 indicators once (shared across all context TFs)
     df_m1 = attach_indicators(df_m1)
-    df_m5 = attach_indicators(df_m5)
 
-    # Shift M5 by 1 to prevent lookahead
-    df_m5_shifted = df_m5.shift(1)
+    for ctx_tf in CONTEXT_TIMEFRAMES:
+        tf_label = ctx_tf.upper().replace('MIN', 'M')  # '5min' → '5M'
 
-    # Build snapshot
-    snap = build_snapshot(df_m1, df_m5, df_m5_shifted, db)
-    if snap is None:
-        return
+        # Resample M1 → context TF
+        df_ctx = resample_ohlcv(df_m1, ctx_tf)
+        min_bars = max(20, 50 // int(ctx_tf.replace('min', '')))
+        if len(df_ctx) < min_bars:
+            continue  # Not enough data yet for this TF
 
-    # Log trend bias
-    if snap.has_slope_data:
-        from strategy import compute_trend_bias
-        bias = compute_trend_bias(
-            snap.m5_ema9, snap.m5_ema21, snap.m5_close,
-            snap.m5_ema9_prev, snap.m5_ema21_prev,
-        )
-        if bias != 'NEUTRAL':
-            print(f"[Trend Filter] M5 bias: {bias} | EMA9: {snap.m5_ema9:.2f} | EMA21: {snap.m5_ema21:.2f} | Close: {snap.m5_close:.2f}")
+        df_ctx = attach_indicators(df_ctx)
+        df_ctx_shifted = df_ctx.shift(1)
 
-    # Evaluate strategies (from strategy.py — single source of truth)
-    now = time.time()
-    signals = evaluate_strategies(snap, cooldowns, now, SPREAD_OFFSET)
+        # Build snapshot using this context TF
+        snap = build_snapshot(df_m1, df_ctx, df_ctx_shifted, db)
+        if snap is None:
+            continue
 
-    # Execute signals
-    for sig in signals:
-        trade_doc = {
-            'symbol': SYMBOL, 'direction': sig.direction, 'status': 'OPEN',
-            'entryPrice': round(sig.entry_price, 3),
-            'tp': round(sig.tp, 3), 'sl': round(sig.sl, 3),
-            'entryTime': int(now * 1000),
-            'signalType': sig.strategy, 'meta': sig.meta, 'lotSize': LOT_SIZE,
-        }
-        db.paper_trades.insert_one(trade_doc)
+        # Evaluate strategies with per-TF cooldowns
+        now = time.time()
+        cooldowns = cooldowns_per_tf[ctx_tf]
+        signals = evaluate_strategies(snap, cooldowns, now, SPREAD_OFFSET)
 
-        # Build header: Arrow | Entry | TP - SL
-        arrow = '↑' if sig.direction == 'LONG' else '↓'
-        tp_dist = abs(sig.tp - sig.entry_price)
-        sl_dist = abs(sig.sl - sig.entry_price)
-        header = f"{arrow} <b>NEW {sig.direction} ${sig.entry_price:.2f} | TP +${tp_dist:.1f} SL -${sl_dist:.1f}</b> ({sig.strategy})"
+        # Execute signals
+        for sig in signals:
+            trade_doc = {
+                'symbol': SYMBOL, 'direction': sig.direction, 'status': 'OPEN',
+                'entryPrice': round(sig.entry_price, 3),
+                'tp': round(sig.tp, 3), 'sl': round(sig.sl, 3),
+                'entryTime': int(now * 1000),
+                'signalType': sig.strategy, 'meta': sig.meta, 'lotSize': LOT_SIZE,
+                'contextTf': tf_label,
+            }
+            db.paper_trades.insert_one(trade_doc)
 
-        live = get_live_price(db) or sig.entry_price
-        msg = build_telegram_message(header, db, live)
+            # Notification: include timeframe
+            arrow = '↑' if sig.direction == 'LONG' else '↓'
+            tp_dist = abs(sig.tp - sig.entry_price)
+            sl_dist = abs(sig.sl - sig.entry_price)
+            header = f"{arrow} <b>NEW {sig.direction} ${sig.entry_price:.2f} | TP +${tp_dist:.1f} SL -${sl_dist:.1f}</b> ({sig.strategy} · {tf_label})"
 
-        notify('TRADE_OPEN', None, msg, trade_doc)
-        print(f"[{sig.strategy}] {sig.direction} at {sig.entry_price:.3f} | TP: {sig.tp:.3f} | SL: {sig.sl:.3f}")
+            live = get_live_price(db) or sig.entry_price
+            msg = build_telegram_message(header, db, live)
+
+            notify('TRADE_OPEN', None, msg, trade_doc)
+            print(f"[{sig.strategy}·{tf_label}] {sig.direction} at {sig.entry_price:.3f} | TP: {sig.tp:.3f} | SL: {sig.sl:.3f}")
 
 
 # ===================== REAL-TIME BROADCAST =====================
@@ -467,17 +464,18 @@ def monitor_trades(db):
             )
 
             strat = trade.get('signalType', '?')
+            ctx_tf = trade.get('contextTf', 'M5')
             hold_mins = (time.time() * 1000 - trade.get('entryTime', 0)) / 60000
 
             # Build header: colored arrow for TP/SL | amount | entry | hold time
             is_tp = close_reason == 'TAKE_PROFIT'
             arrow_icon = _dir_arrow(direction, is_win=is_tp)
             pnl_str = f"{'+'if pnl>=0 else ''}${pnl:.2f}"
-            header = f"{arrow_icon} <b>CLOSED {pnl_str} | ${entry:.2f} → ${live_price:.2f} | {hold_mins:.0f}m</b> ({strat})"
+            header = f"{arrow_icon} <b>CLOSED {pnl_str} | ${entry:.2f} → ${live_price:.2f} | {hold_mins:.0f}m</b> ({strat} · {ctx_tf})"
 
             msg = build_telegram_message(header, db, live_price)
             notify('TRADE_CLOSE', None, msg)
-            print(f"[Monitor] {'✅' if is_tp else '❌'} {direction} {close_reason} | Entry: {entry:.2f} | Exit: {live_price:.2f} | PnL: ${pnl:.2f}")
+            print(f"[Monitor] {'✅' if is_tp else '❌'} {direction} {close_reason} | Entry: {entry:.2f} | Exit: {live_price:.2f} | PnL: ${pnl:.2f} ({ctx_tf})")
 
     # Update peak profit/loss for open trades
     for trade in open_trades:
