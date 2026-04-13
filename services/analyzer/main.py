@@ -208,15 +208,38 @@ def _build_daily_footer(trades):
 
 
 def build_telegram_message(header: str, db, live_price=None) -> str:
-    """Build full Telegram message: header + daily trade list + footer."""
+    """Build full Telegram message: header + daily trade list grouped by TF + footer."""
     today_trades = _get_today_trades(db)
-    trade_lines = _build_trade_list(today_trades, live_price)
     footer = _build_daily_footer(today_trades)
 
     parts = [header, '']
-    if trade_lines:
-        parts.append('─── Today ───')
-        parts.extend(trade_lines)
+
+    if today_trades:
+        # Group trades by context timeframe
+        from collections import OrderedDict
+        tf_order = ['5M', '10M', '15M', '30M']
+        grouped = OrderedDict()
+        for tf in tf_order:
+            grouped[tf] = []
+        for t in today_trades:
+            tf = t.get('contextTf', 'M5')
+            # Normalize: 'M5' → '5M' for display consistency
+            if tf.startswith('M') and tf[1:].isdigit():
+                tf = tf[1:] + 'M'
+            if tf not in grouped:
+                grouped[tf] = []
+            grouped[tf].append(t)
+
+        for tf, tf_trades in grouped.items():
+            if not tf_trades:
+                continue
+            # Per-TF sub-header with PnL
+            closed = [t for t in tf_trades if t.get('status') == 'CLOSED']
+            tf_pnl = sum(t.get('pnl', 0) for t in closed)
+            pnl_str = f"{'+'if tf_pnl>=0 else ''}${tf_pnl:.2f}"
+            parts.append(f"─── {tf} ({pnl_str}) ───")
+            parts.extend(_build_trade_list(tf_trades, live_price))
+
         parts.append('')
     parts.append(footer)
     return '\n'.join(parts)
