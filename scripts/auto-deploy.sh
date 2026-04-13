@@ -43,7 +43,7 @@ if [ "$LOCAL" != "$REMOTE" ]; then
   git reset --hard "origin/$BRANCH"
 
   log "🔨 Rebuilding containers..."
-  docker compose -f "$COMPOSE_FILE" build --no-cache --quiet 2>&1 | tail -5 | tee -a "$LOG_FILE"
+  docker compose -f "$COMPOSE_FILE" build --quiet 2>&1 | tail -5 | tee -a "$LOG_FILE"
 
   log "🚀 Restarting services..."
   docker compose -f "$COMPOSE_FILE" up -d --remove-orphans 2>&1 | tee -a "$LOG_FILE"
