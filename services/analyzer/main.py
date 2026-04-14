@@ -402,6 +402,21 @@ def run_strategies(db):
     # Compute M1 indicators once (shared across all context TFs)
     df_m1 = attach_indicators(df_m1)
 
+    # === Daily trend filter: price vs 5-day MA ===
+    df_daily = df_m1['close'].resample('1D').last().dropna()
+    if len(df_daily) >= 5:
+        ma5 = df_daily.rolling(5).mean().iloc[-1]
+        current_price = df_m1['close'].iloc[-1]
+        if current_price > ma5:
+            daily_trend = 'UP'
+            allowed_dir = 'LONG'
+        else:
+            daily_trend = 'DOWN'
+            allowed_dir = 'SHORT'
+    else:
+        daily_trend = 'NEUTRAL'
+        allowed_dir = None  # Allow both
+
     for ctx_tf in CONTEXT_TIMEFRAMES:
         tf_label = ctx_tf.upper().replace('MIN', 'M')  # '5min' → '5M'
 
@@ -424,20 +439,25 @@ def run_strategies(db):
         cooldowns = cooldowns_per_tf[ctx_tf]
         signals = evaluate_strategies(snap, cooldowns, now, SPREAD_OFFSET)
 
-        # Execute signals
+        # Execute signals (filtered by daily trend)
         for sig in signals:
+            # Daily trend filter: only allow direction matching the trend
+            if allowed_dir and sig.direction != allowed_dir:
+                continue
+
             trade_doc = {
                 'symbol': SYMBOL, 'direction': sig.direction, 'status': 'OPEN',
                 'entryPrice': round(sig.entry_price, 3),
                 'tp': round(sig.tp, 3), 'sl': round(sig.sl, 3),
                 'entryTime': int(now * 1000),
                 'signalType': sig.strategy, 'meta': sig.meta, 'lotSize': LOT_SIZE,
-                'contextTf': tf_label,
+                'contextTf': tf_label, 'dailyTrend': daily_trend,
             }
             db.paper_trades.insert_one(trade_doc)
 
-            # Notification: TF + direction + entry + RSI condition + TP/SL
+            # Notification: trend mode + TF + direction + entry + RSI + TP/SL
             arrow = '↑' if sig.direction == 'LONG' else '↓'
+            trend_icon = '📈' if daily_trend == 'UP' else '📉'
             tp_dist = abs(sig.tp - sig.entry_price)
             sl_dist = abs(sig.sl - sig.entry_price)
             rsi = sig.meta.get('m1_rsi', 0)
@@ -446,7 +466,7 @@ def run_strategies(db):
                 rsi_cond = '≤25' if sig.direction == 'LONG' else '≥75'
             else:
                 rsi_cond = '≤45' if sig.direction == 'LONG' else '≥55'
-            header = f"{arrow} <b>NEW {tf_label} {sig.direction} ${sig.entry_price:.2f} | RSI {rsi:.0f} ({rsi_cond}) | TP +${tp_dist:.1f} | SL -${sl_dist:.1f}</b>"
+            header = f"{trend_icon}{arrow} <b>NEW {tf_label} {sig.direction} ${sig.entry_price:.2f} | RSI {rsi:.0f} ({rsi_cond}) | TP +${tp_dist:.1f} | SL -${sl_dist:.1f}</b>"
 
             live = get_live_price(db) or sig.entry_price
             msg = build_tf_message(header, db, tf=tf_label, live_price=live)
