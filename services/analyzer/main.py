@@ -207,41 +207,72 @@ def _build_daily_footer(trades):
     return f"{pnl_icon} Day: <b>{'+'if total_pnl>=0 else ''}${total_pnl:.2f}</b> | WR: {wr:.0f}% ({wins}/{len(closed)}) | Trades: {len(trades)}"
 
 
-def build_telegram_message(header: str, db, live_price=None) -> str:
-    """Build full Telegram message: header + daily trade list grouped by TF + footer."""
+def _normalize_tf(tf: str) -> str:
+    """Normalize contextTf to display format: 'M5' → '5M', '5M' → '5M'."""
+    if tf.startswith('M') and tf[1:].isdigit():
+        return tf[1:] + 'M'
+    return tf
+
+
+def _group_trades_by_tf(trades):
+    """Group trades by timeframe, maintaining order."""
+    from collections import OrderedDict
+    tf_order = ['5M', '10M', '15M', '30M']
+    grouped = OrderedDict((tf, []) for tf in tf_order)
+    for t in trades:
+        tf = _normalize_tf(t.get('contextTf', 'M5'))
+        if tf not in grouped:
+            grouped[tf] = []
+        grouped[tf].append(t)
+    return grouped
+
+
+def _build_tf_footer(tf: str, tf_trades: list) -> str:
+    """Build per-TF footer: PnL, win rate, trade count."""
+    closed = [t for t in tf_trades if t.get('status') == 'CLOSED']
+    total_pnl = sum(t.get('pnl', 0) for t in closed)
+    wins = sum(1 for t in closed if t.get('pnl', 0) > 0)
+    wr = (wins / len(closed) * 100) if closed else 0
+    pnl_icon = '📈' if total_pnl >= 0 else '📉'
+    return f"{pnl_icon} {tf}: <b>{'+'if total_pnl>=0 else ''}${total_pnl:.2f}</b> | WR: {wr:.0f}% ({wins}/{len(closed)}) | Trades: {len(tf_trades)}"
+
+
+def build_tf_message(header: str, db, tf: str, live_price=None) -> str:
+    """Build a Telegram message for a single TF group.
+
+    Format:
+      header
+      ━━━ 5M ━━━
+      (trades for this TF)
+      📈 5M: +$12.50 | WR: 50% (1/2) | Trades: 2
+      ──────────
+      📈 Day: +$30.00 | WR: 60% (3/5) | Trades: 8
+
+    Telegram max: 4096 characters.
+    """
     today_trades = _get_today_trades(db)
-    footer = _build_daily_footer(today_trades)
+    overall_footer = _build_daily_footer(today_trades)
+    tf_normalized = _normalize_tf(tf)
+
+    # Filter trades for this TF only
+    tf_trades = [t for t in today_trades if _normalize_tf(t.get('contextTf', 'M5')) == tf_normalized]
 
     parts = [header, '']
 
-    if today_trades:
-        # Group trades by context timeframe
-        from collections import OrderedDict
-        tf_order = ['5M', '10M', '15M', '30M']
-        grouped = OrderedDict()
-        for tf in tf_order:
-            grouped[tf] = []
-        for t in today_trades:
-            tf = t.get('contextTf', 'M5')
-            # Normalize: 'M5' → '5M' for display consistency
-            if tf.startswith('M') and tf[1:].isdigit():
-                tf = tf[1:] + 'M'
-            if tf not in grouped:
-                grouped[tf] = []
-            grouped[tf].append(t)
-
-        for tf, tf_trades in grouped.items():
-            if not tf_trades:
-                continue
-            # Per-TF sub-header with PnL
-            closed = [t for t in tf_trades if t.get('status') == 'CLOSED']
-            tf_pnl = sum(t.get('pnl', 0) for t in closed)
-            pnl_str = f"{'+'if tf_pnl>=0 else ''}${tf_pnl:.2f}"
-            parts.append(f"─── {tf} ({pnl_str}) ───")
-            parts.extend(_build_trade_list(tf_trades, live_price))
-
+    if tf_trades:
+        parts.append(f"━━━ {tf_normalized} ━━━")
+        parts.extend(_build_trade_list(tf_trades, live_price))
         parts.append('')
-    parts.append(footer)
+        parts.append(_build_tf_footer(tf_normalized, tf_trades))
+    else:
+        parts.append(f"━━━ {tf_normalized} ━━━")
+        parts.append('<i>No trades yet</i>')
+
+    parts.append('──────────')
+    parts.append(overall_footer)
+    parts.append('')  # Bottom spacing
+    parts.append('')
+    parts.append('')
     return '\n'.join(parts)
 
 
@@ -368,15 +399,14 @@ def run_strategies(db):
             }
             db.paper_trades.insert_one(trade_doc)
 
-            # Notification: include timeframe
+            # Notification: TF + direction + entry + TP/SL
             arrow = '↑' if sig.direction == 'LONG' else '↓'
             tp_dist = abs(sig.tp - sig.entry_price)
             sl_dist = abs(sig.sl - sig.entry_price)
-            header = f"{arrow} <b>NEW {sig.direction} ${sig.entry_price:.2f} | TP +${tp_dist:.1f} SL -${sl_dist:.1f}</b> ({sig.strategy} · {tf_label})"
+            header = f"{arrow} <b>NEW {tf_label} {sig.direction} ${sig.entry_price:.2f} | TP +${tp_dist:.1f} | SL -${sl_dist:.1f}</b>"
 
             live = get_live_price(db) or sig.entry_price
-            msg = build_telegram_message(header, db, live)
-
+            msg = build_tf_message(header, db, tf=tf_label, live_price=live)
             notify('TRADE_OPEN', None, msg, trade_doc)
             print(f"[{sig.strategy}·{tf_label}] {sig.direction} at {sig.entry_price:.3f} | TP: {sig.tp:.3f} | SL: {sig.sl:.3f}")
 
@@ -490,13 +520,13 @@ def monitor_trades(db):
             ctx_tf = trade.get('contextTf', 'M5')
             hold_mins = (time.time() * 1000 - trade.get('entryTime', 0)) / 60000
 
-            # Build header: colored arrow for TP/SL | amount | entry | hold time
+            # Build header: colored arrow | TF | amount | entry→exit | hold time
             is_tp = close_reason == 'TAKE_PROFIT'
             arrow_icon = _dir_arrow(direction, is_win=is_tp)
             pnl_str = f"{'+'if pnl>=0 else ''}${pnl:.2f}"
-            header = f"{arrow_icon} <b>CLOSED {pnl_str} | ${entry:.2f} → ${live_price:.2f} | {hold_mins:.0f}m</b> ({strat} · {ctx_tf})"
+            header = f"{arrow_icon} <b>CLOSED {ctx_tf} {pnl_str} | ${entry:.2f} → ${live_price:.2f} | {hold_mins:.0f}m</b>"
 
-            msg = build_telegram_message(header, db, live_price)
+            msg = build_tf_message(header, db, tf=ctx_tf, live_price=live_price)
             notify('TRADE_CLOSE', None, msg)
             print(f"[Monitor] {'✅' if is_tp else '❌'} {direction} {close_reason} | Entry: {entry:.2f} | Exit: {live_price:.2f} | PnL: ${pnl:.2f} ({ctx_tf})")
 
