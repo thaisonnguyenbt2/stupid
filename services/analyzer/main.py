@@ -205,11 +205,12 @@ def _build_trade_list(trades, live_price):
             arrow = _dir_arrow(direction, is_win)
             pnl = t.get('pnl', 0)
             pnl_str = f"{'+'if pnl>=0 else ''}${pnl:.2f}"
-            reason = 'TP' if t.get('closeReason') == 'TAKE_PROFIT' else 'SL'
+            exit_price = t.get('exitPrice', 0)
 
-            line = f"{arrow} {entry_time} {pnl_str} {reason} {ttg}"
+            line = f"{arrow} {entry_time} {pnl_str} | {entry:.0f}→{exit_price:.0f} | {ttg}"
             if bar:
                 line += f" {bar} {pct_str}"
+            line += f" | pk:{peak:+.1f} lo:{low:+.1f}"
             lines.append(f"<i>{line}</i>")
         else:
             # Active
@@ -220,14 +221,17 @@ def _build_trade_list(trades, live_price):
                 else:
                     unr = (entry - live_price) * POSITION_OZ
                 unr_str = f"{'+'if unr>=0 else ''}${unr:.2f}"
+                price_now = f"{entry:.0f}→{live_price:.0f}"
             else:
                 unr_str = '---'
+                price_now = f"{entry:.0f}→?"
             tp_dist = abs(tp - entry)
             sl_dist = abs(sl - entry)
 
-            line = f"{arrow} {entry_time} {unr_str} +${tp_dist:.0f}/-${sl_dist:.0f} {ttg}"
+            line = f"{arrow} {entry_time} {unr_str} | {price_now} | +${tp_dist:.0f}/-${sl_dist:.0f} {ttg}"
             if bar:
                 line += f" {bar} {pct_str}"
+            line += f" | pk:{peak:+.1f} lo:{low:+.1f}"
             lines.append(f"<b>{line}</b>")
 
     return lines
