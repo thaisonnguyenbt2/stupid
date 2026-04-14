@@ -153,7 +153,9 @@ def _get_today_trades(db):
 def _build_trade_list(trades, live_price):
     """Build the daily trade list lines.
 
-    Each line: Icon | time | $pnl | $entry | TP/SL | peak/low | ⏱time-to-green
+    Each line:
+      Closed: ✅↑ 09:02 +$11.23 TP ⚡ 🟩🟩🟩🟩🟩🟩🟩🟥🟥🟥 72%
+      Open:   ↑ 14:30 +$3.50 +$9/-$6 ⚡ 🟩🟩🟩🟩🟩🟥🟥 71%
     """
     lines = []
     for t in trades:
@@ -169,10 +171,34 @@ def _build_trade_list(trades, live_price):
         peak = t.get('peakProfit', 0)
         low = t.get('peakLoss', 0)
 
-        # Time-to-green indicator
+        # Time-to-green
         first_green = t.get('firstGreenTime')
         if isinstance(first_green, dict):
             first_green = first_green.get('high', 0) * (2**32) + (first_green.get('low', 0) % (2**32))
+
+        if first_green and entry_time_raw:
+            ttg_mins = (first_green - entry_time_raw) / 60000
+            ttg = '⚡' if ttg_mins < 1 else f'⏱{ttg_mins:.0f}m'
+        elif status == 'OPEN':
+            wait = (time.time() * 1000 - entry_time_raw) / 60000
+            ttg = f'🔴{wait:.0f}m'
+        else:
+            ttg = '🔴'
+
+        # Green/Red percentage bar
+        green = t.get('greenTicks', 0)
+        red = t.get('redTicks', 0)
+        total_ticks = green + red
+        if total_ticks > 0:
+            green_pct = green / total_ticks * 100
+            bar_len = 8
+            green_bars = round(green_pct / 100 * bar_len)
+            red_bars = bar_len - green_bars
+            bar = '🟩' * green_bars + '🟥' * red_bars
+            pct_str = f'{green_pct:.0f}%'
+        else:
+            bar = ''
+            pct_str = ''
 
         if status == 'CLOSED':
             is_win = t.get('pnl', 0) > 0
@@ -181,20 +207,12 @@ def _build_trade_list(trades, live_price):
             pnl_str = f"{'+'if pnl>=0 else ''}${pnl:.2f}"
             reason = 'TP' if t.get('closeReason') == 'TAKE_PROFIT' else 'SL'
 
-            # Time to green
-            if first_green and entry_time_raw:
-                ttg_mins = (first_green - entry_time_raw) / 60000
-                if ttg_mins < 1:
-                    ttg = '⚡'  # Instant green
-                else:
-                    ttg = f'⏱{ttg_mins:.0f}m'
-            else:
-                ttg = '⏱❌'  # Never went green
-
-            line = f"{arrow} {entry_time} {pnl_str} {reason} {ttg} pk:${peak:+.1f}/lo:${low:+.1f}"
+            line = f"{arrow} {entry_time} {pnl_str} {reason} {ttg}"
+            if bar:
+                line += f" {bar} {pct_str}"
             lines.append(f"<i>{line}</i>")
         else:
-            # Active — compute unrealized
+            # Active
             arrow = _dir_arrow(direction)
             if live_price:
                 if direction == 'LONG':
@@ -207,16 +225,9 @@ def _build_trade_list(trades, live_price):
             tp_dist = abs(tp - entry)
             sl_dist = abs(sl - entry)
 
-            # Time to green or waiting
-            if first_green:
-                ttg_mins = (first_green - entry_time_raw) / 60000
-                ttg = f'⚡' if ttg_mins < 1 else f'⏱{ttg_mins:.0f}m'
-            else:
-                # Still waiting to go green
-                wait_mins = (time.time() * 1000 - entry_time_raw) / 60000
-                ttg = f'🔴{wait_mins:.0f}m'
-
-            line = f"{arrow} {entry_time} {unr_str} +${tp_dist:.1f}/-${sl_dist:.1f} {ttg} pk:${peak:+.1f}/lo:${low:+.1f}"
+            line = f"{arrow} {entry_time} {unr_str} +${tp_dist:.0f}/-${sl_dist:.0f} {ttg}"
+            if bar:
+                line += f" {bar} {pct_str}"
             lines.append(f"<b>{line}</b>")
 
     return lines
@@ -574,6 +585,7 @@ def monitor_trades(db):
             unrealized = (entry - live_price) * POSITION_OZ
 
         updates = {}
+        inc_updates = {}
         if unrealized > trade.get('peakProfit', 0):
             updates['peakProfit'] = round(unrealized, 2)
         if unrealized < trade.get('peakLoss', 0):
@@ -583,8 +595,19 @@ def monitor_trades(db):
         if unrealized > 0 and not trade.get('firstGreenTime'):
             updates['firstGreenTime'] = int(time.time() * 1000)
 
+        # Count green/red ticks for percentage tracking
+        if unrealized > 0:
+            inc_updates['greenTicks'] = 1
+        else:
+            inc_updates['redTicks'] = 1
+
+        mongo_op = {}
         if updates:
-            db.paper_trades.update_one({'_id': trade['_id']}, {'$set': updates})
+            mongo_op['$set'] = updates
+        if inc_updates:
+            mongo_op['$inc'] = inc_updates
+        if mongo_op:
+            db.paper_trades.update_one({'_id': trade['_id']}, mongo_op)
 
 
 # ===================== REST API =====================
