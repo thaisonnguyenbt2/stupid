@@ -153,8 +153,7 @@ def _get_today_trades(db):
 def _build_trade_list(trades, live_price):
     """Build the daily trade list lines.
 
-    Each line: Icon | opened_time | $amount | $entry | TP/SL | peak/low
-    Green for active, gray for closed.
+    Each line: Icon | time | $pnl | $entry | TP/SL | peak/low | ⏱time-to-green
     """
     lines = []
     for t in trades:
@@ -163,9 +162,17 @@ def _build_trade_list(trades, live_price):
         entry = t.get('entryPrice', 0)
         tp = t.get('tp', 0)
         sl = t.get('sl', 0)
-        entry_time = _fmt_time_short(t.get('entryTime', 0))
+        entry_time_raw = t.get('entryTime', 0)
+        if isinstance(entry_time_raw, dict):
+            entry_time_raw = entry_time_raw.get('high', 0) * (2**32) + (entry_time_raw.get('low', 0) % (2**32))
+        entry_time = _fmt_time_short(entry_time_raw)
         peak = t.get('peakProfit', 0)
         low = t.get('peakLoss', 0)
+
+        # Time-to-green indicator
+        first_green = t.get('firstGreenTime')
+        if isinstance(first_green, dict):
+            first_green = first_green.get('high', 0) * (2**32) + (first_green.get('low', 0) % (2**32))
 
         if status == 'CLOSED':
             is_win = t.get('pnl', 0) > 0
@@ -173,8 +180,18 @@ def _build_trade_list(trades, live_price):
             pnl = t.get('pnl', 0)
             pnl_str = f"{'+'if pnl>=0 else ''}${pnl:.2f}"
             reason = 'TP' if t.get('closeReason') == 'TAKE_PROFIT' else 'SL'
-            line = f"{arrow} {entry_time} {pnl_str} ${entry:.0f} {reason} pk:${peak:+.1f}/lo:${low:+.1f}"
-            # Gray for closed
+
+            # Time to green
+            if first_green and entry_time_raw:
+                ttg_mins = (first_green - entry_time_raw) / 60000
+                if ttg_mins < 1:
+                    ttg = '⚡'  # Instant green
+                else:
+                    ttg = f'⏱{ttg_mins:.0f}m'
+            else:
+                ttg = '⏱❌'  # Never went green
+
+            line = f"{arrow} {entry_time} {pnl_str} {reason} {ttg} pk:${peak:+.1f}/lo:${low:+.1f}"
             lines.append(f"<i>{line}</i>")
         else:
             # Active — compute unrealized
@@ -189,8 +206,17 @@ def _build_trade_list(trades, live_price):
                 unr_str = '---'
             tp_dist = abs(tp - entry)
             sl_dist = abs(sl - entry)
-            line = f"{arrow} {entry_time} {unr_str} ${entry:.0f} +${tp_dist:.1f}/-${sl_dist:.1f} pk:${peak:+.1f}/lo:${low:+.1f}"
-            # Green bold for active
+
+            # Time to green or waiting
+            if first_green:
+                ttg_mins = (first_green - entry_time_raw) / 60000
+                ttg = f'⚡' if ttg_mins < 1 else f'⏱{ttg_mins:.0f}m'
+            else:
+                # Still waiting to go green
+                wait_mins = (time.time() * 1000 - entry_time_raw) / 60000
+                ttg = f'🔴{wait_mins:.0f}m'
+
+            line = f"{arrow} {entry_time} {unr_str} +${tp_dist:.1f}/-${sl_dist:.1f} {ttg} pk:${peak:+.1f}/lo:${low:+.1f}"
             lines.append(f"<b>{line}</b>")
 
     return lines
@@ -552,6 +578,11 @@ def monitor_trades(db):
             updates['peakProfit'] = round(unrealized, 2)
         if unrealized < trade.get('peakLoss', 0):
             updates['peakLoss'] = round(unrealized, 2)
+
+        # Track when trade first goes positive (entry timing quality)
+        if unrealized > 0 and not trade.get('firstGreenTime'):
+            updates['firstGreenTime'] = int(time.time() * 1000)
+
         if updates:
             db.paper_trades.update_one({'_id': trade['_id']}, {'$set': updates})
 
