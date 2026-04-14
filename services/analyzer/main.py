@@ -49,8 +49,8 @@ NOTIFICATION_URL = os.getenv('NOTIFICATION_URL', f"http://localhost:{os.getenv('
 SPREAD_OFFSET = float(os.getenv('SPREAD_OFFSET', '0.0'))
 
 # Cooldown state per context timeframe (each TF trades independently)
-# Backtested: M5 +$48, M10 +$65, M15 +$7, M30 -$769
-CONTEXT_TIMEFRAMES = ['5min', '10min', '15min']
+# Backtested: M5 -$53, M10 +$69, M15 +$61
+CONTEXT_TIMEFRAMES = ['10min', '15min']
 cooldowns_per_tf = {tf: CooldownState() for tf in CONTEXT_TIMEFRAMES}
 
 
@@ -270,8 +270,8 @@ def build_tf_message(header: str, db, tf: str, live_price=None) -> str:
 
     parts.append('──────────')
     parts.append(overall_footer)
-    parts.append('')  # Bottom spacing
     parts.append('')
+    parts.append('━━━━━━━━━━oOo━━━━━━━━━━')
     parts.append('')
     return '\n'.join(parts)
 
@@ -399,11 +399,17 @@ def run_strategies(db):
             }
             db.paper_trades.insert_one(trade_doc)
 
-            # Notification: TF + direction + entry + TP/SL
+            # Notification: TF + direction + entry + RSI condition + TP/SL
             arrow = '↑' if sig.direction == 'LONG' else '↓'
             tp_dist = abs(sig.tp - sig.entry_price)
             sl_dist = abs(sig.sl - sig.entry_price)
-            header = f"{arrow} <b>NEW {tf_label} {sig.direction} ${sig.entry_price:.2f} | TP +${tp_dist:.1f} | SL -${sl_dist:.1f}</b>"
+            rsi = sig.meta.get('m1_rsi', 0)
+            # Show RSI threshold so user can confirm on MT5
+            if sig.strategy == 'BB_REVERSION':
+                rsi_cond = '≤25' if sig.direction == 'LONG' else '≥75'
+            else:
+                rsi_cond = '≤45' if sig.direction == 'LONG' else '≥55'
+            header = f"{arrow} <b>NEW {tf_label} {sig.direction} ${sig.entry_price:.2f} | RSI {rsi:.0f} ({rsi_cond}) | TP +${tp_dist:.1f} | SL -${sl_dist:.1f}</b>"
 
             live = get_live_price(db) or sig.entry_price
             msg = build_tf_message(header, db, tf=tf_label, live_price=live)
