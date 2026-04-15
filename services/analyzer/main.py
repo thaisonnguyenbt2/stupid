@@ -424,7 +424,7 @@ def run_strategies(db):
     # === Macro trend filter: H4 EMA9 vs EMA21 ===
     # Reacts in 4-12 hours. LONG-only when H4 uptrend, SHORT-only when H4 downtrend.
     df_h4 = resample_ohlcv(df_m1, '4h')
-    if len(df_h4) >= 21:
+    if len(df_h4) >= 10:
         h4_ema9 = df_h4['close'].ewm(span=9, adjust=False).mean()
         h4_ema21 = df_h4['close'].ewm(span=21, adjust=False).mean()
         if h4_ema9.iloc[-1] > h4_ema21.iloc[-1]:
@@ -436,6 +436,13 @@ def run_strategies(db):
     else:
         daily_trend = 'NEUTRAL'
         allowed_dir = None  # Allow both
+
+    # Log macro trend every ~60s (≈12 ticks at 5s interval)
+    _trend_log_counter = getattr(run_strategies, '_trend_log_counter', 0) + 1
+    run_strategies._trend_log_counter = _trend_log_counter
+    if _trend_log_counter % 12 == 1:
+        h4_info = f"H4 bars: {len(df_h4)}" if 'df_h4' in dir() else "H4: N/A"
+        print(f"[Trend] {daily_trend} → allowed: {allowed_dir or 'BOTH'} | M1: {len(df_m1)} bars | {h4_info}")
 
     for ctx_tf in CONTEXT_TIMEFRAMES:
         tf_label = ctx_tf.upper().replace('MIN', 'M')  # '5min' → '5M'
@@ -463,6 +470,19 @@ def run_strategies(db):
         for sig in signals:
             # Daily trend filter: only allow direction matching the trend
             if allowed_dir and sig.direction != allowed_dir:
+                print(f"[Trend] ⛔ BLOCKED {sig.direction} {sig.strategy} on {tf_label} | H4 trend={daily_trend}, allowed={allowed_dir}")
+                # Alert via Telegram once per hour
+                last_block_alert = getattr(run_strategies, '_last_block_alert', 0)
+                if now - last_block_alert > 3600:
+                    run_strategies._last_block_alert = now
+                    trend_icon = '📈' if daily_trend == 'UP' else '📉'
+                    alert = f"{trend_icon} <b>SIGNAL BLOCKED</b>\n\n"
+                    alert += f"H4 trend: {daily_trend} → only {allowed_dir} allowed\n"
+                    alert += f"Signal: {sig.direction} {sig.strategy} on {tf_label}\n"
+                    alert += f"Price: ${sig.entry_price:.2f}\n\n"
+                    alert += f"<i>M15 and H4 disagree. Waiting for alignment.</i>\n"
+                    alert += '━━━━━━━━━━oOo━━━━━━━━━━'
+                    notify('TREND_BLOCK', None, alert)
                 continue
 
             trade_doc = {
