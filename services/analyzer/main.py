@@ -483,52 +483,60 @@ def run_strategies(db):
         cooldowns = cooldowns_per_tf[ctx_tf]
         signals = evaluate_strategies(snap, cooldowns, now, SPREAD_OFFSET)
 
-        # Execute signals (filtered by daily trend)
+        # Execute signals (soft trend filter)
         for sig in signals:
-            # Daily trend filter: only allow direction matching the trend
-            if allowed_dir and sig.direction != allowed_dir:
-                print(f"[Trend] ⛔ BLOCKED {sig.direction} {sig.strategy} on {tf_label} | H4 trend={daily_trend}, allowed={allowed_dir}")
-                # Alert via Telegram once per hour
-                last_block_alert = getattr(run_strategies, '_last_block_alert', 0)
-                if now - last_block_alert > 3600:
-                    run_strategies._last_block_alert = now
-                    trend_icon = '📈' if daily_trend == 'UP' else '📉'
-                    alert = f"{trend_icon} <b>SIGNAL BLOCKED</b>\n\n"
-                    alert += f"H4 trend: {daily_trend} → only {allowed_dir} allowed\n"
-                    alert += f"Signal: {sig.direction} {sig.strategy} on {tf_label}\n"
-                    alert += f"Price: ${sig.entry_price:.2f}\n\n"
-                    alert += f"<i>M15 and H4 disagree. Waiting for alignment.</i>\n"
-                    alert += '━━━━━━━━━━oOo━━━━━━━━━━'
-                    notify('TREND_BLOCK', None, alert)
-                continue
+            # Determine if this is a counter-trend trade
+            is_counter = allowed_dir and sig.direction != allowed_dir
+
+            # Counter-trend: tighten TP/SL to reduce risk
+            tp_final = sig.tp
+            sl_final = sig.sl
+            trade_label = ''
+            if is_counter:
+                entry = sig.entry_price
+                orig_tp_dist = abs(sig.tp - entry)
+                orig_sl_dist = abs(sig.sl - entry)
+                # Tighter: TP 0.8x, SL 0.7x of original
+                new_tp_dist = orig_tp_dist * 0.8
+                new_sl_dist = orig_sl_dist * 0.7
+                if sig.direction == 'LONG':
+                    tp_final = entry + new_tp_dist
+                    sl_final = entry - new_sl_dist
+                else:
+                    tp_final = entry - new_tp_dist
+                    sl_final = entry + new_sl_dist
+                trade_label = '⚠️CT'
+                print(f"[Trend] ⚠️ COUNTER-TREND {sig.direction} {sig.strategy} on {tf_label} | H4={daily_trend} | TP:{orig_tp_dist:.1f}→{new_tp_dist:.1f} SL:{orig_sl_dist:.1f}→{new_sl_dist:.1f}")
 
             trade_doc = {
                 'symbol': SYMBOL, 'direction': sig.direction, 'status': 'OPEN',
                 'entryPrice': round(sig.entry_price, 3),
-                'tp': round(sig.tp, 3), 'sl': round(sig.sl, 3),
+                'tp': round(tp_final, 3), 'sl': round(sl_final, 3),
                 'entryTime': int(now * 1000),
                 'signalType': sig.strategy, 'meta': sig.meta, 'lotSize': LOT_SIZE,
                 'contextTf': tf_label, 'dailyTrend': daily_trend,
+                'counterTrend': is_counter,
             }
             db.paper_trades.insert_one(trade_doc)
 
             # Notification: trend mode + TF + direction + entry + RSI + TP/SL
             arrow = '↑' if sig.direction == 'LONG' else '↓'
             trend_icon = '📈' if daily_trend == 'UP' else '📉'
-            tp_dist = abs(sig.tp - sig.entry_price)
-            sl_dist = abs(sig.sl - sig.entry_price)
+            tp_dist = abs(tp_final - sig.entry_price)
+            sl_dist = abs(sl_final - sig.entry_price)
             rsi = sig.meta.get('m1_rsi', 0)
             # Show RSI threshold so user can confirm on MT5
             if sig.strategy == 'BB_REVERSION':
                 rsi_cond = '≤25' if sig.direction == 'LONG' else '≥75'
             else:
                 rsi_cond = '≤45' if sig.direction == 'LONG' else '≥55'
-            header = f"{trend_icon}{arrow} <b>NEW {tf_label} {sig.direction} ${sig.entry_price:.2f} | RSI {rsi:.0f} ({rsi_cond}) | TP +${tp_dist:.1f} | SL -${sl_dist:.1f}</b>"
+            ct_tag = f' {trade_label}' if trade_label else ''
+            header = f"{trend_icon}{arrow} <b>NEW {tf_label} {sig.direction}{ct_tag} ${sig.entry_price:.2f} | RSI {rsi:.0f} ({rsi_cond}) | TP +${tp_dist:.1f} | SL -${sl_dist:.1f}</b>"
 
             live = get_live_price(db) or sig.entry_price
             msg = build_tf_message(header, db, tf=tf_label, live_price=live)
             notify('TRADE_OPEN', None, msg, trade_doc)
-            print(f"[{sig.strategy}·{tf_label}] {sig.direction} at {sig.entry_price:.3f} | TP: {sig.tp:.3f} | SL: {sig.sl:.3f}")
+            print(f"[{sig.strategy}·{tf_label}] {sig.direction}{ct_tag} at {sig.entry_price:.3f} | TP: {tp_final:.3f} | SL: {sl_final:.3f}")
 
 
 # ===================== REAL-TIME BROADCAST =====================
