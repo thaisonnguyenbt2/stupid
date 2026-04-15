@@ -398,7 +398,7 @@ def build_snapshot(df_m1, df_m5, df_m5_shifted, db) -> MarketSnapshot:
 
 def run_strategies(db):
     """Execute all strategies across all context timeframes. Called every 5s."""
-    df_m1 = load_candles(db, SYMBOL, 500)
+    df_m1 = load_candles(db, SYMBOL, 6000)  # ~4 days, enough for H4 EMA21
     if df_m1 is None or len(df_m1) < 50:
         print(f"[Analyzer] Insufficient data: {len(df_m1) if df_m1 is not None else 0} M1 candles. Need 50+.")
         return
@@ -406,12 +406,13 @@ def run_strategies(db):
     # Compute M1 indicators once (shared across all context TFs)
     df_m1 = attach_indicators(df_m1)
 
-    # === Daily trend filter: price vs 5-day MA ===
-    df_daily = df_m1['close'].resample('1D').last().dropna()
-    if len(df_daily) >= 5:
-        ma5 = df_daily.rolling(5).mean().iloc[-1]
-        current_price = df_m1['close'].iloc[-1]
-        if current_price > ma5:
+    # === Macro trend filter: H4 EMA9 vs EMA21 ===
+    # Reacts in 4-12 hours. LONG-only when H4 uptrend, SHORT-only when H4 downtrend.
+    df_h4 = resample_ohlcv(df_m1, '4h')
+    if len(df_h4) >= 21:
+        h4_ema9 = df_h4['close'].ewm(span=9, adjust=False).mean()
+        h4_ema21 = df_h4['close'].ewm(span=21, adjust=False).mean()
+        if h4_ema9.iloc[-1] > h4_ema21.iloc[-1]:
             daily_trend = 'UP'
             allowed_dir = 'LONG'
         else:
