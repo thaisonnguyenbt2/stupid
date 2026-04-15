@@ -411,9 +411,46 @@ def build_snapshot(df_m1, df_m5, df_m5_shifted, db) -> MarketSnapshot:
     )
 
 
+def _compute_h4_trend(db):
+    """Compute H4 macro trend (cached, refreshed every 5 min)."""
+    now = time.time()
+    last = getattr(_compute_h4_trend, '_last_check', 0)
+    cached = getattr(_compute_h4_trend, '_cached_result', ('NEUTRAL', None))
+
+    if now - last < 300:  # Refresh every 5 minutes
+        return cached
+
+    _compute_h4_trend._last_check = now
+    try:
+        df_m1 = load_candles(db, SYMBOL, 6000)
+        if df_m1 is None or len(df_m1) < 2400:  # Need ~40h of data for H4
+            _compute_h4_trend._cached_result = ('NEUTRAL', None)
+            return ('NEUTRAL', None)
+
+        df_h4 = resample_ohlcv(df_m1, '4h')
+        if len(df_h4) < 10:
+            _compute_h4_trend._cached_result = ('NEUTRAL', None)
+            return ('NEUTRAL', None)
+
+        h4_ema9 = df_h4['close'].ewm(span=9, adjust=False).mean().iloc[-1]
+        h4_ema21 = df_h4['close'].ewm(span=21, adjust=False).mean().iloc[-1]
+
+        if h4_ema9 > h4_ema21:
+            result = ('UP', 'LONG')
+        else:
+            result = ('DOWN', 'SHORT')
+        _compute_h4_trend._cached_result = result
+        print(f"[Trend] H4 refresh: {result[0]} → allowed: {result[1]} | H4 bars: {len(df_h4)} | EMA9: {h4_ema9:.2f} EMA21: {h4_ema21:.2f}")
+        return result
+    except Exception as e:
+        print(f"[Trend] H4 compute error: {e}")
+        _compute_h4_trend._cached_result = ('NEUTRAL', None)
+        return ('NEUTRAL', None)
+
+
 def run_strategies(db):
     """Execute all strategies across all context timeframes. Called every 5s."""
-    df_m1 = load_candles(db, SYMBOL, 6000)  # ~4 days, enough for H4 EMA21
+    df_m1 = load_candles(db, SYMBOL, 500)  # Fast: only 500 bars for trading
     if df_m1 is None or len(df_m1) < 50:
         print(f"[Analyzer] Insufficient data: {len(df_m1) if df_m1 is not None else 0} M1 candles. Need 50+.")
         return
@@ -421,28 +458,8 @@ def run_strategies(db):
     # Compute M1 indicators once (shared across all context TFs)
     df_m1 = attach_indicators(df_m1)
 
-    # === Macro trend filter: H4 EMA9 vs EMA21 ===
-    # Reacts in 4-12 hours. LONG-only when H4 uptrend, SHORT-only when H4 downtrend.
-    df_h4 = resample_ohlcv(df_m1, '4h')
-    if len(df_h4) >= 10:
-        h4_ema9 = df_h4['close'].ewm(span=9, adjust=False).mean()
-        h4_ema21 = df_h4['close'].ewm(span=21, adjust=False).mean()
-        if h4_ema9.iloc[-1] > h4_ema21.iloc[-1]:
-            daily_trend = 'UP'
-            allowed_dir = 'LONG'
-        else:
-            daily_trend = 'DOWN'
-            allowed_dir = 'SHORT'
-    else:
-        daily_trend = 'NEUTRAL'
-        allowed_dir = None  # Allow both
-
-    # Log macro trend every ~60s (≈12 ticks at 5s interval)
-    _trend_log_counter = getattr(run_strategies, '_trend_log_counter', 0) + 1
-    run_strategies._trend_log_counter = _trend_log_counter
-    if _trend_log_counter % 12 == 1:
-        h4_info = f"H4 bars: {len(df_h4)}" if 'df_h4' in dir() else "H4: N/A"
-        print(f"[Trend] {daily_trend} → allowed: {allowed_dir or 'BOTH'} | M1: {len(df_m1)} bars | {h4_info}")
+    # === Macro trend filter (cached, refreshed every 5 min) ===
+    daily_trend, allowed_dir = _compute_h4_trend(db)
 
     for ctx_tf in CONTEXT_TIMEFRAMES:
         tf_label = ctx_tf.upper().replace('MIN', 'M')  # '5min' → '5M'
