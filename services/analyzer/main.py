@@ -185,16 +185,31 @@ def _build_trade_list(trades, live_price):
         else:
             ttg = '🔴'
 
-        # Green/Red percentage bar
-        green = t.get('greenTicks', 0)
-        red = t.get('redTicks', 0)
-        total_ticks = green + red
-        if total_ticks > 0:
-            green_pct = green / total_ticks * 100
+        # Chronological green/red timeline bar
+        timeline = t.get('pnlTimeline', [])
+        # Also support legacy greenTicks/redTicks
+        if not timeline and (t.get('greenTicks', 0) + t.get('redTicks', 0)) > 0:
+            g = t.get('greenTicks', 0)
+            r = t.get('redTicks', 0)
+            timeline = ['G'] * g + ['R'] * r  # fallback (not chronological)
+
+        if timeline:
+            total_ticks = len(timeline)
+            green_count = sum(1 for c in timeline if c == 'G')
+            green_pct = green_count / total_ticks * 100
+
+            # Downsample to 8 boxes showing the actual timeline
             bar_len = 8
-            green_bars = round(green_pct / 100 * bar_len)
-            red_bars = bar_len - green_bars
-            bar = '🟩' * green_bars + '🟥' * red_bars
+            bar = ''
+            for i in range(bar_len):
+                start = int(i * total_ticks / bar_len)
+                end = int((i + 1) * total_ticks / bar_len)
+                segment = timeline[start:end]
+                if segment:
+                    seg_green = sum(1 for c in segment if c == 'G')
+                    bar += '🟩' if seg_green >= len(segment) / 2 else '🟥'
+                else:
+                    bar += '⬜'
             pct_str = f'{green_pct:.0f}%'
         else:
             bar = ''
@@ -610,7 +625,6 @@ def monitor_trades(db):
             unrealized = (entry - live_price) * POSITION_OZ
 
         updates = {}
-        inc_updates = {}
         if unrealized > trade.get('peakProfit', 0):
             updates['peakProfit'] = round(unrealized, 2)
         if unrealized < trade.get('peakLoss', 0):
@@ -620,19 +634,13 @@ def monitor_trades(db):
         if unrealized > 0 and not trade.get('firstGreenTime'):
             updates['firstGreenTime'] = int(time.time() * 1000)
 
-        # Count green/red ticks for percentage tracking
-        if unrealized > 0:
-            inc_updates['greenTicks'] = 1
-        else:
-            inc_updates['redTicks'] = 1
+        # Append to timeline: 'G' for green, 'R' for red
+        tick_char = 'G' if unrealized > 0 else 'R'
 
-        mongo_op = {}
+        mongo_op = {'$push': {'pnlTimeline': tick_char}}
         if updates:
             mongo_op['$set'] = updates
-        if inc_updates:
-            mongo_op['$inc'] = inc_updates
-        if mongo_op:
-            db.paper_trades.update_one({'_id': trade['_id']}, mongo_op)
+        db.paper_trades.update_one({'_id': trade['_id']}, mongo_op)
 
 
 # ===================== REST API =====================
