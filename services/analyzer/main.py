@@ -422,40 +422,40 @@ def build_snapshot(df_m1, df_m5, df_m5_shifted, db) -> MarketSnapshot:
     )
 
 
-def _compute_h4_trend(db):
-    """Compute H4 macro trend (cached, refreshed every 5 min)."""
+def _compute_macro_trend(db):
+    """Compute H1 macro trend (cached, refreshed every 2 min)."""
     now = time.time()
-    last = getattr(_compute_h4_trend, '_last_check', 0)
-    cached = getattr(_compute_h4_trend, '_cached_result', ('NEUTRAL', None))
+    last = getattr(_compute_macro_trend, '_last_check', 0)
+    cached = getattr(_compute_macro_trend, '_cached_result', ('NEUTRAL', None))
 
-    if now - last < 300:  # Refresh every 5 minutes
+    if now - last < 120:  # Refresh every 2 minutes (H1 is faster than H4)
         return cached
 
-    _compute_h4_trend._last_check = now
+    _compute_macro_trend._last_check = now
     try:
-        df_m1 = load_candles(db, SYMBOL, 6000)
-        if df_m1 is None or len(df_m1) < 2400:  # Need ~40h of data for H4
-            _compute_h4_trend._cached_result = ('NEUTRAL', None)
+        df_m1 = load_candles(db, SYMBOL, 1500)  # ~25h, enough for H1 EMA21
+        if df_m1 is None or len(df_m1) < 600:  # Need ~10h minimum
+            _compute_macro_trend._cached_result = ('NEUTRAL', None)
             return ('NEUTRAL', None)
 
-        df_h4 = resample_ohlcv(df_m1, '4h')
-        if len(df_h4) < 10:
-            _compute_h4_trend._cached_result = ('NEUTRAL', None)
+        df_h1 = resample_ohlcv(df_m1, '1h')
+        if len(df_h1) < 10:
+            _compute_macro_trend._cached_result = ('NEUTRAL', None)
             return ('NEUTRAL', None)
 
-        h4_ema9 = df_h4['close'].ewm(span=9, adjust=False).mean().iloc[-1]
-        h4_ema21 = df_h4['close'].ewm(span=21, adjust=False).mean().iloc[-1]
+        h1_ema9 = df_h1['close'].ewm(span=9, adjust=False).mean().iloc[-1]
+        h1_ema21 = df_h1['close'].ewm(span=21, adjust=False).mean().iloc[-1]
 
-        if h4_ema9 > h4_ema21:
+        if h1_ema9 > h1_ema21:
             result = ('UP', 'LONG')
         else:
             result = ('DOWN', 'SHORT')
-        _compute_h4_trend._cached_result = result
-        print(f"[Trend] H4 refresh: {result[0]} → allowed: {result[1]} | H4 bars: {len(df_h4)} | EMA9: {h4_ema9:.2f} EMA21: {h4_ema21:.2f}")
+        _compute_macro_trend._cached_result = result
+        print(f"[Trend] H1 refresh: {result[0]} → allowed: {result[1]} | H1 bars: {len(df_h1)} | EMA9: {h1_ema9:.2f} EMA21: {h1_ema21:.2f}")
         return result
     except Exception as e:
-        print(f"[Trend] H4 compute error: {e}")
-        _compute_h4_trend._cached_result = ('NEUTRAL', None)
+        print(f"[Trend] H1 compute error: {e}")
+        _compute_macro_trend._cached_result = ('NEUTRAL', None)
         return ('NEUTRAL', None)
 
 
@@ -470,7 +470,7 @@ def run_strategies(db):
     df_m1 = attach_indicators(df_m1)
 
     # === Macro trend filter (cached, refreshed every 5 min) ===
-    daily_trend, allowed_dir = _compute_h4_trend(db)
+    daily_trend, allowed_dir = _compute_macro_trend(db)
 
     for ctx_tf in CONTEXT_TIMEFRAMES:
         tf_label = ctx_tf.upper().replace('MIN', 'M')  # '5min' → '5M'
@@ -494,60 +494,48 @@ def run_strategies(db):
         cooldowns = cooldowns_per_tf[ctx_tf]
         signals = evaluate_strategies(snap, cooldowns, now, SPREAD_OFFSET)
 
-        # Execute signals (soft trend filter)
-        for sig in signals:
-            # Determine if this is a counter-trend trade
-            is_counter = allowed_dir and sig.direction != allowed_dir
+        # Log M15 state every ~5 min when no signals
+        if not signals:
+            _ema_log_counter = getattr(run_strategies, f'_ema_log_{ctx_tf}', 0) + 1
+            setattr(run_strategies, f'_ema_log_{ctx_tf}', _ema_log_counter)
+            if _ema_log_counter % 60 == 1:  # every ~5 min (60 × 5s)
+                bull = snap.m5_ema9 > snap.m5_ema21 > snap.m5_ema50
+                bear = snap.m5_ema9 < snap.m5_ema21 < snap.m5_ema50
+                align = '🟢BULL' if bull else ('🔴BEAR' if bear else '⚪NEUTRAL')
+                print(f"[{tf_label}] {align} | EMA9:{snap.m5_ema9:.1f} EMA21:{snap.m5_ema21:.1f} EMA50:{snap.m5_ema50:.1f} | RSI:{snap.m1_rsi:.0f} | No signals")
 
-            # Counter-trend: tighten TP/SL to reduce risk
-            tp_final = sig.tp
-            sl_final = sig.sl
-            trade_label = ''
-            if is_counter:
-                entry = sig.entry_price
-                orig_tp_dist = abs(sig.tp - entry)
-                orig_sl_dist = abs(sig.sl - entry)
-                # Tighter: TP 0.8x, SL 0.7x of original
-                new_tp_dist = orig_tp_dist * 0.8
-                new_sl_dist = orig_sl_dist * 0.7
-                if sig.direction == 'LONG':
-                    tp_final = entry + new_tp_dist
-                    sl_final = entry - new_sl_dist
-                else:
-                    tp_final = entry - new_tp_dist
-                    sl_final = entry + new_sl_dist
-                trade_label = '⚠️CT'
-                print(f"[Trend] ⚠️ COUNTER-TREND {sig.direction} {sig.strategy} on {tf_label} | H4={daily_trend} | TP:{orig_tp_dist:.1f}→{new_tp_dist:.1f} SL:{orig_sl_dist:.1f}→{new_sl_dist:.1f}")
+        # Execute signals (H4 trend filter: hard block counter-trend)
+        for sig in signals:
+            if allowed_dir and sig.direction != allowed_dir:
+                print(f"[Trend] ⛔ BLOCKED {sig.direction} {sig.strategy} on {tf_label} | H4={daily_trend}")
+                continue
 
             trade_doc = {
                 'symbol': SYMBOL, 'direction': sig.direction, 'status': 'OPEN',
                 'entryPrice': round(sig.entry_price, 3),
-                'tp': round(tp_final, 3), 'sl': round(sl_final, 3),
+                'tp': round(sig.tp, 3), 'sl': round(sig.sl, 3),
                 'entryTime': int(now * 1000),
                 'signalType': sig.strategy, 'meta': sig.meta, 'lotSize': LOT_SIZE,
                 'contextTf': tf_label, 'dailyTrend': daily_trend,
-                'counterTrend': is_counter,
             }
             db.paper_trades.insert_one(trade_doc)
 
-            # Notification: trend mode + TF + direction + entry + RSI + TP/SL
+            # Notification
             arrow = '↑' if sig.direction == 'LONG' else '↓'
             trend_icon = '📈' if daily_trend == 'UP' else '📉'
-            tp_dist = abs(tp_final - sig.entry_price)
-            sl_dist = abs(sl_final - sig.entry_price)
+            tp_dist = abs(sig.tp - sig.entry_price)
+            sl_dist = abs(sig.sl - sig.entry_price)
             rsi = sig.meta.get('m1_rsi', 0)
-            # Show RSI threshold so user can confirm on MT5
             if sig.strategy == 'BB_REVERSION':
                 rsi_cond = '≤25' if sig.direction == 'LONG' else '≥75'
             else:
                 rsi_cond = '≤45' if sig.direction == 'LONG' else '≥55'
-            ct_tag = f' {trade_label}' if trade_label else ''
-            header = f"{trend_icon}{arrow} <b>NEW {tf_label} {sig.direction}{ct_tag} ${sig.entry_price:.2f} | RSI {rsi:.0f} ({rsi_cond}) | TP +${tp_dist:.1f} | SL -${sl_dist:.1f}</b>"
+            header = f"{trend_icon}{arrow} <b>NEW {tf_label} {sig.direction} ${sig.entry_price:.2f} | RSI {rsi:.0f} ({rsi_cond}) | TP +${tp_dist:.1f} | SL -${sl_dist:.1f}</b>"
 
             live = get_live_price(db) or sig.entry_price
             msg = build_tf_message(header, db, tf=tf_label, live_price=live)
             notify('TRADE_OPEN', None, msg, trade_doc)
-            print(f"[{sig.strategy}·{tf_label}] {sig.direction}{ct_tag} at {sig.entry_price:.3f} | TP: {tp_final:.3f} | SL: {sl_final:.3f}")
+            print(f"[{sig.strategy}·{tf_label}] {sig.direction} at {sig.entry_price:.3f} | TP: {sig.tp:.3f} | SL: {sig.sl:.3f}")
 
 
 # ===================== REAL-TIME BROADCAST =====================
