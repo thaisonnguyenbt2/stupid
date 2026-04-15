@@ -222,10 +222,17 @@ def _build_trade_list(trades, live_price):
             pnl_str = f"{'+'if pnl>=0 else ''}${pnl:.2f}"
             exit_price = t.get('exitPrice', 0)
 
+            # Trade duration
+            exit_time_raw = t.get('exitTime', 0)
+            if isinstance(exit_time_raw, dict):
+                exit_time_raw = exit_time_raw.get('high', 0) * (2**32) + (exit_time_raw.get('low', 0) % (2**32))
+            dur_mins = (exit_time_raw - entry_time_raw) / 60000 if exit_time_raw and entry_time_raw else 0
+            dur_str = f'{int(dur_mins//60)}h{int(dur_mins%60)}m' if dur_mins >= 60 else f'{int(dur_mins)}m'
+
             line = f"{arrow} {entry_time} {pnl_str} | {entry:.0f}→{exit_price:.0f} | {ttg}"
             if bar:
                 line += f" {bar} {pct_str}"
-            line += f" | pk:{peak:+.1f} lo:{low:+.1f}"
+            line += f" {dur_str} | pk:{peak:+.1f} lo:{low:+.1f}"
             lines.append(f"<i>{line}</i>")
         else:
             # Active
@@ -243,10 +250,14 @@ def _build_trade_list(trades, live_price):
             tp_dist = abs(tp - entry)
             sl_dist = abs(sl - entry)
 
+            # Trade duration (live)
+            dur_mins = (time.time() * 1000 - entry_time_raw) / 60000 if entry_time_raw else 0
+            dur_str = f'{int(dur_mins//60)}h{int(dur_mins%60)}m' if dur_mins >= 60 else f'{int(dur_mins)}m'
+
             line = f"{arrow} {entry_time} {unr_str} | {price_now} | +${tp_dist:.0f}/-${sl_dist:.0f} {ttg}"
             if bar:
                 line += f" {bar} {pct_str}"
-            line += f" | pk:{peak:+.1f} lo:{low:+.1f}"
+            line += f" {dur_str} | pk:{peak:+.1f} lo:{low:+.1f}"
             lines.append(f"<b>{line}</b>")
 
     return lines
