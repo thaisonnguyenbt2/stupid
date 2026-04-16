@@ -469,8 +469,9 @@ def run_strategies(db):
     # Compute M1 indicators once (shared across all context TFs)
     df_m1 = attach_indicators(df_m1)
 
-    # === Macro trend filter (cached, refreshed every 5 min) ===
-    daily_trend, allowed_dir = _compute_macro_trend(db)
+    # === Macro trend (logged only, no blocking) ===
+    daily_trend, _ = _compute_macro_trend(db)
+    allowed_dir = None  # Disabled: allow both directions
 
     for ctx_tf in CONTEXT_TIMEFRAMES:
         tf_label = ctx_tf.upper().replace('MIN', 'M')  # '5min' → '5M'

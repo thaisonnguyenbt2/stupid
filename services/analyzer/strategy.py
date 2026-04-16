@@ -31,7 +31,7 @@ LOT_SIZE = 0.01
 CONTRACT_SIZE = 100        # 1 lot = 100 troy oz
 POSITION_OZ = LOT_SIZE * CONTRACT_SIZE  # 1.0 oz
 
-# Strategy TP/SL multipliers (user test: wider SL for fewer stops)
+# Strategy TP/SL multipliers (user preferred: wider SL for fewer stops)
 EMA_TP_MULT = 2.2
 EMA_SL_MULT = 1.5
 BB_TP_MULT = 2.2
