@@ -418,12 +418,16 @@ def _compute_macro_trend(db):
         h1_ema9 = df_h1['close'].ewm(span=9, adjust=False).mean().iloc[-1]
         h1_ema21 = df_h1['close'].ewm(span=21, adjust=False).mean().iloc[-1]
 
-        if h1_ema9 > h1_ema21:
+        # NEUTRAL zone: when EMAs are within 0.05% (~$2.5 at $5000), don't force a direction
+        gap_pct = abs(h1_ema9 - h1_ema21) / h1_ema21 * 100
+        if gap_pct < 0.05:
+            result = ('NEUTRAL', None)
+        elif h1_ema9 > h1_ema21:
             result = ('UP', 'LONG')
         else:
             result = ('DOWN', 'SHORT')
         _compute_macro_trend._cached_result = result
-        print(f"[Trend] H1 refresh: {result[0]} → allowed: {result[1]} | H1 bars: {len(df_h1)} | EMA9: {h1_ema9:.2f} EMA21: {h1_ema21:.2f}")
+        print(f"[Trend] H1 refresh: {result[0]} → allowed: {result[1] or 'BOTH'} | H1 bars: {len(df_h1)} | EMA9: {h1_ema9:.2f} EMA21: {h1_ema21:.2f} | gap: {gap_pct:.3f}%")
         return result
     except Exception as e:
         print(f"[Trend] H1 compute error: {e}")
@@ -461,10 +465,10 @@ def _get_trade_mode(db, slot_name):
 
     Flow:
       1. Query trades closed in the last 1 hour for this slot
-      2. Feed new closings into EMA: score = 0.7 × old + 0.3 × outcome (±1)
+      2. Feed new closings into EMA: score = 0.75 × old + 0.25 × outcome (±1)
       3. Apply hysteresis:
-         - score > +0.2  → NORMAL  (recently winning → keep direction)
-         - score < -0.2  → REVERSE (recently losing → flip direction)
+         - score > +0.4  → NORMAL  (recently winning → keep direction)
+         - score < -0.4  → REVERSE (recently losing → flip direction)
          - in between    → keep current mode (don't switch on noise)
       4. If no trades in window and score near 0 → fall back to session default
     """
@@ -546,6 +550,16 @@ def _get_trade_mode(db, slot_name):
     return new_mode, h
 
 
+def _restore_cooldown(cooldowns, strategy_name, saved):
+    """Restore cooldown for a specific strategy when its signal was blocked by a guard."""
+    if strategy_name == 'EMA_PULLBACK':
+        cooldowns.last_ema = saved[0]
+    elif strategy_name == 'BB_REVERSION':
+        cooldowns.last_bb = saved[1]
+    elif strategy_name == 'INST_BREAKOUT':
+        cooldowns.last_inst = saved[2]
+
+
 def run_strategies(db):
     """Execute all strategies across all context timeframes. Called every 5s."""
     df_m1 = load_candles(db, SYMBOL, 500)  # Fast: only 500 bars for trading
@@ -573,6 +587,10 @@ def run_strategies(db):
     for slot in RR_SLOTS:
         trade_mode, hour_vnt = _get_trade_mode(db, slot['name'])
         cooldowns = cooldowns_per_slot[slot['name']]
+
+        # Save cooldown state so we can restore if signal gets blocked by guards
+        saved_cd = (cooldowns.last_ema, cooldowns.last_bb, cooldowns.last_inst)
+
         signals = evaluate_strategies(snap, cooldowns, now, SPREAD_OFFSET)
         slot_label = f"{slot['name']}({slot['label']})"
 
@@ -589,8 +607,8 @@ def run_strategies(db):
         # Execute signals per slot with its own TP/SL
         for sig in signals:
             atr = snap.m5_atr
-            tp_dist = atr * slot['tp_mult']
-            sl_dist = atr * slot['sl_mult']
+            tp_dist = atr * slot['tp_mult'] - SPREAD_OFFSET   # Spread shrinks TP distance
+            sl_dist = atr * slot['sl_mult'] + SPREAD_OFFSET   # Spread widens SL distance
 
             if trade_mode == 'REVERSE':
                 exec_dir = 'SHORT' if sig.direction == 'LONG' else 'LONG'
@@ -602,6 +620,8 @@ def run_strategies(db):
             # If H1 EMA9 > EMA21 → only LONG allowed; vice versa.
             macro_trend, allowed_dir = _compute_macro_trend(db)
             if allowed_dir and exec_dir != allowed_dir:
+                # Restore cooldown — don't waste it on a blocked signal
+                _restore_cooldown(cooldowns, sig.strategy, saved_cd)
                 print(f"[{sig.strategy}·{slot_label}] ⛔ H1 trend {macro_trend} blocks {exec_dir} (only {allowed_dir} allowed)")
                 continue
 
@@ -616,6 +636,8 @@ def run_strategies(db):
                 for t in open_in_slot
             )
             if too_close:
+                # Restore cooldown — don't waste it on a blocked signal
+                _restore_cooldown(cooldowns, sig.strategy, saved_cd)
                 print(f"[{sig.strategy}·{slot_label}] ⛔ Duplicate: OPEN trade within $5 of {sig.entry_price:.2f}")
                 continue
 

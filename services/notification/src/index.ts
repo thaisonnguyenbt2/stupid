@@ -15,8 +15,11 @@ app.use(express.json());
 const PORT = process.env.NOTIFICATION_PORT || 4003;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
-const TELEGRAM_CHAT_ID_2 = process.env.TELEGRAM_CHAT_ID_2 || '';
-const TELEGRAM_CHAT_ID_3 = process.env.TELEGRAM_CHAT_ID_3 || '';
+
+// Hardcoded chat IDs for per-slot routing (env var override supported)
+// Slot C (1:1 R:R) → separate group | Slot B (1.7:1 R:R) → separate group
+const TELEGRAM_CHAT_ID_2 = process.env.TELEGRAM_CHAT_ID_2 || '-5155166563';
+const TELEGRAM_CHAT_ID_3 = process.env.TELEGRAM_CHAT_ID_3 || '-5224929333';
 
 // Slot → chat routing: '2' → CHAT_ID_2 (1:1 R:R), '3' → CHAT_ID_3 (1.7:1 R:R)
 const CHAT_ID_MAP: Record<string, string> = {
