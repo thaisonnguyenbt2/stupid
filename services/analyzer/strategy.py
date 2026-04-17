@@ -31,13 +31,13 @@ LOT_SIZE = 0.01
 CONTRACT_SIZE = 100        # 1 lot = 100 troy oz
 POSITION_OZ = LOT_SIZE * CONTRACT_SIZE  # 1.0 oz
 
-# Strategy TP/SL multipliers (user preferred: wider SL for fewer stops)
-EMA_TP_MULT = 2.2
-EMA_SL_MULT = 1.5
-BB_TP_MULT = 2.2
-BB_SL_MULT = 1.5
-INST_TP_MULT = 2.2
-INST_SL_MULT = 1.5
+# Strategy TP/SL multipliers (best: 3:1 R:R, no filter, +$851/mo)
+EMA_TP_MULT = 1.5
+EMA_SL_MULT = 0.5
+BB_TP_MULT = 1.5
+BB_SL_MULT = 0.5
+INST_TP_MULT = 1.5
+INST_SL_MULT = 0.5
 
 # Trend filter thresholds
 EMA9_SLOPE_THRESHOLD = 0.5  # USD per 15-min lookback
