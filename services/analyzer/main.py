@@ -437,8 +437,8 @@ def _compute_macro_trend(db):
 _NY_HOURS_VNT = {20, 21, 22, 23, 0, 1, 2, 3}
 
 # EMA tuning
-_SM_ALPHA = 0.3         # Weight per trade (higher = more reactive)
-_SM_THRESHOLD = 0.2     # Hysteresis band — switch only when |score| > this
+_SM_ALPHA = 0.25        # Weight per trade (higher = more reactive)
+_SM_THRESHOLD = 0.4     # Hysteresis band — switch only when |score| > this
 _SM_DECAY_SECS = 1800   # Start decaying score after 30 min without trades
 
 # Per-slot state (in-memory; resets on restart → session default until trades flow)
