@@ -471,32 +471,37 @@ def run_strategies(db):
                 print(f"[Trend] ⛔ BLOCKED {sig.direction} {sig.strategy} on {tf_label} | H4={daily_trend}")
                 continue
 
+            # === REVERSE MODE: flip direction, swap TP↔SL ===
+            rev_dir = 'SHORT' if sig.direction == 'LONG' else 'LONG'
+            rev_tp = sig.sl   # old SL becomes new TP
+            rev_sl = sig.tp   # old TP becomes new SL
+
             trade_doc = {
-                'symbol': SYMBOL, 'direction': sig.direction, 'status': 'OPEN',
+                'symbol': SYMBOL, 'direction': rev_dir, 'status': 'OPEN',
                 'entryPrice': round(sig.entry_price, 3),
-                'tp': round(sig.tp, 3), 'sl': round(sig.sl, 3),
+                'tp': round(rev_tp, 3), 'sl': round(rev_sl, 3),
                 'entryTime': int(now * 1000),
                 'signalType': sig.strategy, 'meta': sig.meta, 'lotSize': LOT_SIZE,
                 'contextTf': tf_label, 'dailyTrend': daily_trend,
             }
             db.paper_trades.insert_one(trade_doc)
 
-            # Notification
-            arrow = '↑' if sig.direction == 'LONG' else '↓'
+            # Notification (reversed)
+            arrow = '↑' if rev_dir == 'LONG' else '↓'
             trend_icon = '📈' if daily_trend == 'UP' else '📉'
-            tp_dist = abs(sig.tp - sig.entry_price)
-            sl_dist = abs(sig.sl - sig.entry_price)
+            tp_dist = abs(rev_tp - sig.entry_price)
+            sl_dist = abs(rev_sl - sig.entry_price)
             rsi = sig.meta.get('m1_rsi', 0)
             if sig.strategy == 'BB_REVERSION':
                 rsi_cond = '≤25' if sig.direction == 'LONG' else '≥75'
             else:
                 rsi_cond = '≤45' if sig.direction == 'LONG' else '≥55'
-            header = f"{trend_icon}{arrow} <b>NEW {tf_label} {sig.direction} ${sig.entry_price:.2f} | RSI {rsi:.0f} ({rsi_cond}) | TP +${tp_dist:.1f} | SL -${sl_dist:.1f}</b>"
+            header = f"{trend_icon}{arrow} <b>NEW {tf_label} {rev_dir} ${sig.entry_price:.2f} | RSI {rsi:.0f} ({rsi_cond}) | TP +${tp_dist:.1f} | SL -${sl_dist:.1f}</b>"
 
             live = get_live_price(db) or sig.entry_price
             msg = build_tf_message(header, db, tf=tf_label, live_price=live)
             notify('TRADE_OPEN', None, msg, trade_doc)
-            print(f"[{sig.strategy}·{tf_label}] {sig.direction} at {sig.entry_price:.3f} | TP: {sig.tp:.3f} | SL: {sig.sl:.3f}")
+            print(f"[{sig.strategy}·{tf_label}] REVERSED {sig.direction}→{rev_dir} at {sig.entry_price:.3f} | TP: {rev_tp:.3f} | SL: {rev_sl:.3f}")
 
 
 # ===================== REAL-TIME BROADCAST =====================
