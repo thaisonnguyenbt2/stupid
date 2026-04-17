@@ -218,33 +218,14 @@ def is_counter_trend(
 ) -> bool:
     """Return True if this direction fights the M5 trend.
 
-    Two-layer filter:
-      1. Hard block: if M5 trend is strongly opposite to direction
-      2. Soft block: if price broke EMA21 structure or EMA9 slope diverges
+    Hard block only: if M5 trend is strongly opposite to direction.
+    (Soft block removed — too aggressive for M15 context, blocks valid
+    pullback entries for 15+ min when a single bar closes below EMA21.)
     """
-    # --- Hard block ---
     if m5_trend_bias == 'BEAR_STRONG' and direction == 'LONG':
         return True
     if m5_trend_bias == 'BULL_STRONG' and direction == 'SHORT':
         return True
-
-    # --- Soft block ---
-    if ema9_slope is not None:
-        if direction == 'LONG':
-            # Block LONG when price broke below EMA21
-            if m5_close < m5_ema21:
-                return True
-            # Block LONG when EMA9 is falling fast
-            if ema9_slope < -EMA9_SLOPE_THRESHOLD:
-                return True
-
-        if direction == 'SHORT':
-            # Block SHORT when price broke above EMA21
-            if m5_close > m5_ema21:
-                return True
-            # Block SHORT when EMA9 is rising fast
-            if ema9_slope > EMA9_SLOPE_THRESHOLD:
-                return True
 
     return False
 
