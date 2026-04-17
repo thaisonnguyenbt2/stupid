@@ -193,14 +193,7 @@ def _build_trade_list(trades, live_price):
             r = t.get('redTicks', 0)
             timeline = ['G'] * g + ['R'] * r  # fallback (not chronological)
 
-        # Timeline: just percentage
-        if timeline:
-            total_ticks = len(timeline)
-            green_count = sum(1 for c in timeline if c == 'G')
-            green_pct = green_count / total_ticks * 100
-            tl_str = f'{green_pct:.0f}%'
-        else:
-            tl_str = ''
+
 
         if status == 'CLOSED':
             is_win = t.get('pnl', 0) > 0
@@ -213,8 +206,7 @@ def _build_trade_list(trades, live_price):
             dur_mins = (exit_time_raw - entry_time_raw) / 60000 if exit_time_raw and entry_time_raw else 0
             dur_str = f'{int(dur_mins//60)}h{int(dur_mins%60)}m' if dur_mins >= 60 else f'{int(dur_mins)}m'
 
-            # Table: status+time | peak|low | timeline% | duration
-            line = f"{arrow} {entry_time} | {low:+.1f} {entry:.0f} {peak:+.1f} | {tl_str} | {dur_str}"
+            line = f"{arrow} {entry_time} | {low:+.1f} {entry:.0f} {peak:+.1f} | {dur_str}"
             lines.append(f"<i>{line}</i>")
         else:
             # Active
@@ -224,8 +216,7 @@ def _build_trade_list(trades, live_price):
             dur_mins = (time.time() * 1000 - entry_time_raw) / 60000 if entry_time_raw else 0
             dur_str = f'{int(dur_mins//60)}h{int(dur_mins%60)}m' if dur_mins >= 60 else f'{int(dur_mins)}m'
 
-            # Table: status+time | peak low | timeline% | duration
-            line = f"{arrow} {entry_time} | {low:+.1f} {entry:.0f} {peak:+.1f} | {tl_str} | {dur_str}"
+            line = f"{arrow} {entry_time} | {low:+.1f} {entry:.0f} {peak:+.1f} | {dur_str}"
             lines.append(f"<b>{line}</b>")
 
     return lines
@@ -617,11 +608,35 @@ def monitor_trades(db):
             ctx_tf = trade.get('contextTf', 'M5')
             hold_mins = (time.time() * 1000 - trade.get('entryTime', 0)) / 60000
 
-            # Build header: colored arrow | TF | amount | entry→exit | hold time
+            # Build header with timeline
             is_tp = close_reason == 'TAKE_PROFIT'
             arrow_icon = _dir_arrow(direction, is_win=is_tp)
             pnl_str = f"{'+'if pnl>=0 else ''}${pnl:.2f}"
-            header = f"{arrow_icon} <b>CLOSED {ctx_tf} {pnl_str} | ${entry:.2f} → ${live_price:.2f} | {hold_mins:.0f}m</b>"
+
+            # Build 🟥🟩 timeline bar
+            tl_data = trade.get('pnlTimeline', [])
+            if not tl_data and (trade.get('greenTicks', 0) + trade.get('redTicks', 0)) > 0:
+                g = trade.get('greenTicks', 0)
+                r = trade.get('redTicks', 0)
+                tl_data = ['G'] * g + ['R'] * r
+            tl_bar = ''
+            if tl_data:
+                total = len(tl_data)
+                green_n = sum(1 for c in tl_data if c == 'G')
+                green_pct = green_n / total * 100
+                bar_len = 8
+                for bi in range(bar_len):
+                    s = int(bi * total / bar_len)
+                    e = int((bi + 1) * total / bar_len)
+                    seg = tl_data[s:e]
+                    if seg:
+                        sg = sum(1 for c in seg if c == 'G')
+                        tl_bar += '🟩' if sg >= len(seg) / 2 else '🟥'
+                    else:
+                        tl_bar += '⬜'
+                tl_bar = f' {tl_bar} {green_pct:.0f}%'
+
+            header = f"{arrow_icon} <b>CLOSED {ctx_tf} {pnl_str} | ${entry:.2f} → ${live_price:.2f} | {hold_mins:.0f}m</b>{tl_bar}"
 
             msg = build_tf_message(header, db, tf=ctx_tf, live_price=live_price)
             notify('TRADE_CLOSE', None, msg)
