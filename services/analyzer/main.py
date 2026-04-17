@@ -118,15 +118,15 @@ def get_live_price(db):
 
 
 def _dir_arrow(direction, is_win=None):
-    """Return arrow icon for direction. ✅/❌ for win/loss, plain arrow for open."""
+    """Return arrow icon for direction. ✅/❌ for win/loss, ⏳ for open."""
     if direction == 'LONG':
         if is_win is True:   return '✅↑'
         if is_win is False:  return '❌↑'
-        return '↑'
+        return '⏳↑'
     else:
         if is_win is True:   return '✅↓'
         if is_win is False:  return '❌↓'
-        return '↓'
+        return '⏳↓'
 
 
 def _fmt_time_short(epoch_ms):
@@ -193,34 +193,30 @@ def _build_trade_list(trades, live_price):
             r = t.get('redTicks', 0)
             timeline = ['G'] * g + ['R'] * r  # fallback (not chronological)
 
+        # Timeline: replace 🟩🟥 with ↑↓
         if timeline:
             total_ticks = len(timeline)
             green_count = sum(1 for c in timeline if c == 'G')
             green_pct = green_count / total_ticks * 100
 
-            # Downsample to 8 boxes showing the actual timeline
             bar_len = 8
-            bar = ''
+            tl = ''
             for i in range(bar_len):
                 start = int(i * total_ticks / bar_len)
                 end = int((i + 1) * total_ticks / bar_len)
                 segment = timeline[start:end]
                 if segment:
                     seg_green = sum(1 for c in segment if c == 'G')
-                    bar += '🟩' if seg_green >= len(segment) / 2 else '🟥'
+                    tl += '↑' if seg_green >= len(segment) / 2 else '↓'
                 else:
-                    bar += '⬜'
-            pct_str = f'{green_pct:.0f}%'
+                    tl += '-'
+            tl_str = f'{tl} {green_pct:.0f}%'
         else:
-            bar = ''
-            pct_str = ''
+            tl_str = ''
 
         if status == 'CLOSED':
             is_win = t.get('pnl', 0) > 0
             arrow = _dir_arrow(direction, is_win)
-            pnl = t.get('pnl', 0)
-            pnl_str = f"{'+'if pnl>=0 else ''}${pnl:.2f}"
-            exit_price = t.get('exitPrice', 0)
 
             # Trade duration
             exit_time_raw = t.get('exitTime', 0)
@@ -229,35 +225,19 @@ def _build_trade_list(trades, live_price):
             dur_mins = (exit_time_raw - entry_time_raw) / 60000 if exit_time_raw and entry_time_raw else 0
             dur_str = f'{int(dur_mins//60)}h{int(dur_mins%60)}m' if dur_mins >= 60 else f'{int(dur_mins)}m'
 
-            line = f"{arrow} {entry_time} {pnl_str} | {entry:.0f}→{exit_price:.0f} | {ttg}"
-            if bar:
-                line += f" {bar} {pct_str}"
-            line += f" {dur_str} | pk:{peak:+.1f} lo:{low:+.1f}"
+            # Table: status+time | peak|low | timeline% | duration
+            line = f"{arrow} {entry_time} | {low:+.1f} {entry:.0f} {peak:+.1f} | {tl_str} | {dur_str}"
             lines.append(f"<i>{line}</i>")
         else:
             # Active
             arrow = _dir_arrow(direction)
-            if live_price:
-                if direction == 'LONG':
-                    unr = (live_price - entry) * POSITION_OZ
-                else:
-                    unr = (entry - live_price) * POSITION_OZ
-                unr_str = f"{'+'if unr>=0 else ''}${unr:.2f}"
-                price_now = f"{entry:.0f}→{live_price:.0f}"
-            else:
-                unr_str = '---'
-                price_now = f"{entry:.0f}→?"
-            tp_dist = abs(tp - entry)
-            sl_dist = abs(sl - entry)
 
             # Trade duration (live)
             dur_mins = (time.time() * 1000 - entry_time_raw) / 60000 if entry_time_raw else 0
             dur_str = f'{int(dur_mins//60)}h{int(dur_mins%60)}m' if dur_mins >= 60 else f'{int(dur_mins)}m'
 
-            line = f"{arrow} {entry_time} {unr_str} | {price_now} | +${tp_dist:.0f}/-${sl_dist:.0f} {ttg}"
-            if bar:
-                line += f" {bar} {pct_str}"
-            line += f" {dur_str} | pk:{peak:+.1f} lo:{low:+.1f}"
+            # Table: status+time | peak low | timeline% | duration
+            line = f"{arrow} {entry_time} | {low:+.1f} {entry:.0f} {peak:+.1f} | {tl_str} | {dur_str}"
             lines.append(f"<b>{line}</b>")
 
     return lines
@@ -271,7 +251,8 @@ def _build_daily_footer(trades):
     wins = sum(1 for t in closed if t.get('pnl', 0) > 0)
     wr = (wins / len(closed) * 100) if closed else 0
     pnl_icon = '📈' if total_pnl >= 0 else '📉'
-    return f"{pnl_icon} Day: <b>{'+'if total_pnl>=0 else ''}${total_pnl:.2f}</b> | WR: {wr:.0f}% ({wins}/{len(closed)}) | Trades: {len(trades)}"
+    open_tag = f' ({open_count} open)' if open_count else ''
+    return f"{pnl_icon} Day: <b>{'+'if total_pnl>=0 else ''}${total_pnl:.2f}</b> | WR: {wr:.0f}% ({wins}/{len(closed)}) | Trades: {len(trades)}{open_tag}"
 
 
 def _normalize_tf(tf: str) -> str:
@@ -338,7 +319,7 @@ def build_tf_message(header: str, db, tf: str, live_price=None) -> str:
     parts.append('──────────')
     parts.append(overall_footer)
     parts.append('')
-    parts.append('━━━━━━━━━━oOo━━━━━━━━━━')
+    parts.append('━━━━━━oOo━━━━━━')
     parts.append('')
     return '\n'.join(parts)
 
