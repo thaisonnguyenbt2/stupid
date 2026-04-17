@@ -15,6 +15,15 @@ app.use(express.json());
 const PORT = process.env.NOTIFICATION_PORT || 4003;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
+const TELEGRAM_CHAT_ID_2 = process.env.TELEGRAM_CHAT_ID_2 || '';
+const TELEGRAM_CHAT_ID_3 = process.env.TELEGRAM_CHAT_ID_3 || '';
+
+// Slot → chat routing: '2' → CHAT_ID_2 (1:1 R:R), '3' → CHAT_ID_3 (1.7:1 R:R)
+const CHAT_ID_MAP: Record<string, string> = {
+  'default': TELEGRAM_CHAT_ID,
+  '2': TELEGRAM_CHAT_ID_2,
+  '3': TELEGRAM_CHAT_ID_3,
+};
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
@@ -35,8 +44,9 @@ function broadcastEvent(event: any): void {
   }
 }
 
-async function sendTelegram(message: string): Promise<boolean> {
-  if (!TELEGRAM_BOT_TOKEN || TELEGRAM_BOT_TOKEN === 'YOUR_BOT_TOKEN_HERE' || !TELEGRAM_CHAT_ID) {
+async function sendTelegram(message: string, chatId?: string): Promise<boolean> {
+  const targetChatId = chatId || TELEGRAM_CHAT_ID;
+  if (!TELEGRAM_BOT_TOKEN || TELEGRAM_BOT_TOKEN === 'YOUR_BOT_TOKEN_HERE' || !targetChatId) {
     console.warn('[Telegram] Missing credentials. Message:', message.substring(0, 80));
     return false;
   }
@@ -44,13 +54,14 @@ async function sendTelegram(message: string): Promise<boolean> {
   try {
     const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
     const res = await axios.post(url, {
-      chat_id: TELEGRAM_CHAT_ID,
+      chat_id: targetChatId,
       text: message,
       parse_mode: 'HTML'
     }, { timeout: 10000 });
 
     if (res.status === 200) {
-      console.log(`[Telegram] ✅ Sent: ${message.substring(0, 60)}...`);
+      const chatLabel = chatId ? `chat:${targetChatId}` : 'default';
+      console.log(`[Telegram] ✅ Sent (${chatLabel}): ${message.substring(0, 60)}...`);
       return true;
     } else {
       console.error('[Telegram] Failed:', res.data);
@@ -80,8 +91,10 @@ app.post('/api/notify', async (req, res) => {
 
     // Skip Telegram for bulk state broadcasts (TRADES_UPDATE)
     if (type !== 'TRADES_UPDATE') {
+      const { targetChat } = req.body;
+      const resolvedChatId = CHAT_ID_MAP[targetChat || 'default'] || TELEGRAM_CHAT_ID;
       const telegramMsg = title ? `${title}\n\n${message}` : message;
-      sent = await sendTelegram(telegramMsg);
+      sent = await sendTelegram(telegramMsg, resolvedChatId);
     }
 
     // Broadcast to WebSocket clients (frontend)

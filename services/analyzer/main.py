@@ -58,12 +58,16 @@ RR_SLOTS = [
 CONTEXT_TF = '15min'  # Single context TF for all slots
 cooldowns_per_slot = {s['name']: CooldownState() for s in RR_SLOTS}
 
+# Slot → Telegram chat routing
+# C (1:1 R:R) → CHAT_ID_2 | B (1.7:1 R:R) → CHAT_ID_3 | A (3:1) → default
+SLOT_CHAT_MAP = {'C': '2', 'B': '3'}
+
 
 # ===================== NOTIFICATION HELPER =====================
 
 notify_fail_count = 0
 
-def notify(type_: str, title: str, message: str, trade: dict = None):
+def notify(type_: str, title: str, message: str, trade: dict = None, target_chat: str = None):
     """Send notification to the notification service."""
     global notify_fail_count
     try:
@@ -71,6 +75,8 @@ def notify(type_: str, title: str, message: str, trade: dict = None):
         if trade:
             clean = {k: str(v) if k == '_id' else v for k, v in trade.items()}
             payload['trade'] = clean
+        if target_chat:
+            payload['targetChat'] = target_chat
         resp = requests.post(NOTIFICATION_URL, json=payload, timeout=5)
         if resp.status_code != 200:
             notify_fail_count += 1
@@ -425,93 +431,119 @@ def _compute_macro_trend(db):
         return ('NEUTRAL', None)
 
 
-# === DYNAMIC SMART MODE (per-slot) ===
-_FALLBACK_REVERSE = {1, 2, 4, 5, 7, 8, 9, 10, 12, 17, 20, 21, 23}
-_sm_cache = {}           # {(slot_name, hour): 'NORMAL'|'REVERSE'}
-_sm_last_calc = 0        # last recalc timestamp
-_sm_last_notified = {}   # {slot_name: 'hour:mode'}
-SM_RECALC_SECS = 3600    # recalc every hour
-SM_MIN_TRADES = 5        # min trades/hour/slot to trust data
+# === DYNAMIC SMART MODE (EMA Rolling Score) ===
+# Cold-start session defaults (VNT timezone):
+#   NY active hours → NORMAL | Asian/London/NY-close → REVERSE
+_NY_HOURS_VNT = {20, 21, 22, 23, 0, 1, 2, 3}
 
-def _compute_smart_mode(db):
-    """Analyze last 7 days of closed trades → NORMAL/REVERSE per slot per VNT hour."""
+# EMA tuning
+_SM_ALPHA = 0.3         # Weight per trade (higher = more reactive)
+_SM_THRESHOLD = 0.2     # Hysteresis band — switch only when |score| > this
+_SM_DECAY_SECS = 1800   # Start decaying score after 30 min without trades
+
+# Per-slot state (in-memory; resets on restart → session default until trades flow)
+_edge_scores = {}       # {slot_name: float}  EMA score in [-1, +1]
+_current_modes = {}     # {slot_name: str}    active NORMAL/REVERSE
+_seen_trade_ids = {}    # {slot_name: set}    already-processed trade IDs
+_sm_last_notified = {}  # {slot_name: str}    "hour:mode" for dedup
+_sm_last_update = {}    # {slot_name: float}  timestamp of last EMA update
+
+
+def _session_default_mode():
+    """NORMAL during NY session, REVERSE otherwise (VNT)."""
     from datetime import datetime, timezone, timedelta
-    global _sm_cache, _sm_last_calc
-    now = time.time()
-    if now - _sm_last_calc < SM_RECALC_SECS and _sm_cache:
-        return
-    vnt = timezone(timedelta(hours=7))
-    week_ago_ms = int((now - 7 * 86400) * 1000)
-    closed = list(db.paper_trades.find({'status': 'CLOSED', 'entryTime': {'$gte': week_ago_ms}}))
+    h = datetime.now(timezone(timedelta(hours=7))).hour
+    return 'NORMAL' if h in _NY_HOURS_VNT else 'REVERSE'
 
-    slot_names = [s['name'] for s in RR_SLOTS]
-
-    if not closed:
-        for sn in slot_names:
-            for h in range(24):
-                _sm_cache[(sn, h)] = 'REVERSE' if h in _FALLBACK_REVERSE else 'NORMAL'
-        _sm_last_calc = now
-        print(f"[SmartMode] No data → fallback schedule (all slots)")
-        return
-
-    # Group PnL by (slot, hour)
-    hourly = {}
-    for sn in slot_names:
-        for h in range(24):
-            hourly[(sn, h)] = []
-
-    for t in closed:
-        ems = t.get('entryTime', 0)
-        if isinstance(ems, dict):
-            ems = ems.get('high', 0) * (2**32) + (ems.get('low', 0) % (2**32))
-        dt = datetime.fromtimestamp(ems / 1000, tz=vnt)
-        ctx = t.get('contextTf', '')
-        # Extract slot name: "A(3:1)" → "A"
-        sn = ctx.split('(')[0] if '(' in ctx else ctx
-        if sn not in slot_names:
-            continue  # legacy trade, skip
-        hourly[(sn, dt.hour)].append(t.get('pnl', 0))
-
-    changes = []
-    for sn in slot_names:
-        for h in range(24):
-            tr = hourly[(sn, h)]
-            if len(tr) >= SM_MIN_TRADES:
-                mode = 'REVERSE' if sum(tr) < 0 else 'NORMAL'
-            else:
-                mode = 'REVERSE' if h in _FALLBACK_REVERSE else 'NORMAL'
-            old = _sm_cache.get((sn, h))
-            if old and old != mode:
-                changes.append(f'{sn}@{h:02d} {old}→{mode}')
-            _sm_cache[(sn, h)] = mode
-
-    _sm_last_calc = now
-    for sn in slot_names:
-        nr = sum(1 for h in range(24) if _sm_cache.get((sn, h)) == 'REVERSE')
-        dh = sum(1 for h in range(24) if len(hourly[(sn, h)]) >= SM_MIN_TRADES)
-        print(f"[SmartMode] {sn}: {nr}/24h REV | {dh}/24 data-driven")
-    if changes:
-        print(f"[SmartMode] Changes: {', '.join(changes[:8])}")
 
 def _get_trade_mode(db, slot_name):
-    """Get NORMAL/REVERSE for current VNT hour + slot. Notify on switch."""
+    """Get NORMAL/REVERSE for this slot using rolling EMA of recent outcomes.
+
+    Flow:
+      1. Query trades closed in the last 1 hour for this slot
+      2. Feed new closings into EMA: score = 0.7 × old + 0.3 × outcome (±1)
+      3. Apply hysteresis:
+         - score > +0.2  → NORMAL  (recently winning → keep direction)
+         - score < -0.2  → REVERSE (recently losing → flip direction)
+         - in between    → keep current mode (don't switch on noise)
+      4. If no trades in window and score near 0 → fall back to session default
+    """
     from datetime import datetime, timezone, timedelta
-    global _sm_last_notified
-    _compute_smart_mode(db)
+
+    # Lazy init on first call per slot
+    if slot_name not in _edge_scores:
+        _edge_scores[slot_name] = 0.0
+        _current_modes[slot_name] = _session_default_mode()
+        _seen_trade_ids[slot_name] = set()
+        _sm_last_update[slot_name] = time.time()
+
+    now = time.time()
+
+    # 1. Query last-hour closed trades for this slot
+    one_hour_ago_ms = int((now - 3600) * 1000)
+    slot_prefix = f"{slot_name}("
+    recent_closed = [
+        t for t in db.paper_trades.find({
+            'status': 'CLOSED',
+            'exitTime': {'$gte': one_hour_ago_ms},
+        }).sort('exitTime', 1)
+        if t.get('contextTf', '').startswith(slot_prefix)
+    ]
+
+    # 2. Update EMA with newly closed trades
+    new_count = 0
+    for t in recent_closed:
+        tid = str(t['_id'])
+        if tid in _seen_trade_ids[slot_name]:
+            continue
+        _seen_trade_ids[slot_name].add(tid)
+        outcome = +1.0 if t.get('pnl', 0) > 0 else -1.0
+        _edge_scores[slot_name] = (1 - _SM_ALPHA) * _edge_scores[slot_name] + _SM_ALPHA * outcome
+        _sm_last_update[slot_name] = now
+        new_count += 1
+
+    # Prune trade IDs that fell out of the 1h window
+    current_ids = {str(t['_id']) for t in recent_closed}
+    _seen_trade_ids[slot_name] &= current_ids
+
+    # 3. Time-based decay: score drifts toward 0 when no trades flow in
+    elapsed = now - _sm_last_update.get(slot_name, now)
+    if elapsed > _SM_DECAY_SECS:
+        decay = 0.95 ** (elapsed / _SM_DECAY_SECS)  # ~5% per 30 min
+        _edge_scores[slot_name] *= decay
+
+    # 4. Decide mode with hysteresis
+    score = _edge_scores[slot_name]
+    if score > _SM_THRESHOLD:
+        new_mode = 'NORMAL'
+    elif score < -_SM_THRESHOLD:
+        new_mode = 'REVERSE'
+    elif not recent_closed and abs(score) < 0.05:
+        # No recent data, score decayed to ~0 → use session default
+        new_mode = _session_default_mode()
+    else:
+        new_mode = _current_modes[slot_name]  # hysteresis: keep current
+
+    # 5. Notify on mode switch
     vnt = timezone(timedelta(hours=7))
     h = datetime.now(vnt).hour
-    mode = _sm_cache.get((slot_name, h), 'NORMAL')
-    key = f"{h}:{mode}"
+    key = f"{h}:{new_mode}"
     prev = _sm_last_notified.get(slot_name)
     if prev is not None and prev != key:
-        icon = '🔄' if mode == 'REVERSE' else '▶️'
+        icon = '🔄' if new_mode == 'REVERSE' else '▶️'
         slot_info = next((s for s in RR_SLOTS if s['name'] == slot_name), {})
         label = f"{slot_name}({slot_info.get('label', '')})"
-        msg = f"{icon} <b>{label} → {mode}</b> (VNT {h:02d}:00)"
+        msg = f"{icon} <b>{label} → {new_mode}</b> (score: {score:+.2f} | VNT {h:02d}:00)"
         notify('MODE_SWITCH', None, msg)
-        print(f"[SmartMode] 📢 {label} → {mode} (VNT {h:02d}:00)")
+        print(f"[SmartMode] 📢 {label} → {new_mode} (score: {score:+.2f} | VNT {h:02d}:00)")
     _sm_last_notified[slot_name] = key
-    return mode, h
+
+    _current_modes[slot_name] = new_mode
+
+    if new_count > 0:
+        print(f"[SmartMode] {slot_name}: score={score:+.2f} → {new_mode} ({new_count} new, {len(recent_closed)} in 1h)")
+
+    return new_mode, h
 
 
 def run_strategies(db):
@@ -565,6 +597,28 @@ def run_strategies(db):
             else:
                 exec_dir = sig.direction
 
+            # --- GUARD 1: H1 macro trend filter ---
+            # Prevents consecutive trades going in opposite directions.
+            # If H1 EMA9 > EMA21 → only LONG allowed; vice versa.
+            macro_trend, allowed_dir = _compute_macro_trend(db)
+            if allowed_dir and exec_dir != allowed_dir:
+                print(f"[{sig.strategy}·{slot_label}] ⛔ H1 trend {macro_trend} blocks {exec_dir} (only {allowed_dir} allowed)")
+                continue
+
+            # --- GUARD 2: Duplicate price guard ($5 minimum distance) ---
+            # Don't open same-slot trade if an existing OPEN trade is within $5.
+            open_in_slot = list(db.paper_trades.find({
+                'status': 'OPEN',
+                'contextTf': slot_label,
+            }))
+            too_close = any(
+                abs(t.get('entryPrice', 0) - sig.entry_price) < 5.0
+                for t in open_in_slot
+            )
+            if too_close:
+                print(f"[{sig.strategy}·{slot_label}] ⛔ Duplicate: OPEN trade within $5 of {sig.entry_price:.2f}")
+                continue
+
             if exec_dir == 'LONG':
                 exec_tp = sig.entry_price + tp_dist
                 exec_sl = sig.entry_price - sl_dist
@@ -594,7 +648,8 @@ def run_strategies(db):
 
             live = get_live_price(db) or sig.entry_price
             msg = build_tf_message(header, db, tf=slot_label, live_price=live)
-            notify('TRADE_OPEN', None, msg, trade_doc)
+            target_chat = SLOT_CHAT_MAP.get(slot['name'])
+            notify('TRADE_OPEN', None, msg, trade_doc, target_chat=target_chat)
             rev_tag = f" REV {sig.direction}→{exec_dir}" if trade_mode == 'REVERSE' else ''
             print(f"[{sig.strategy}·{slot_label}] {exec_dir}{rev_tag} at {sig.entry_price:.3f} | TP: {exec_tp:.3f} | SL: {exec_sl:.3f} [{trade_mode}]")
 
@@ -739,7 +794,9 @@ def monitor_trades(db):
             header = f"{arrow_icon} <b>CLOSED {ctx_tf} {pnl_str} | ${entry:.2f} → ${live_price:.2f} | {hold_mins:.0f}m</b>{tl_bar}"
 
             msg = build_tf_message(header, db, tf=ctx_tf, live_price=live_price)
-            notify('TRADE_CLOSE', None, msg)
+            slot_key = ctx_tf.split('(')[0] if '(' in ctx_tf else ''
+            target_chat = SLOT_CHAT_MAP.get(slot_key)
+            notify('TRADE_CLOSE', None, msg, target_chat=target_chat)
             print(f"[Monitor] {'✅' if is_tp else '❌'} {direction} {close_reason} | Entry: {entry:.2f} | Exit: {live_price:.2f} | PnL: ${pnl:.2f} ({ctx_tf})")
 
     # Update peak profit/loss for open trades
