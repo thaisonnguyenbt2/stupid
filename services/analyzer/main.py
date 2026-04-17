@@ -48,10 +48,15 @@ ANALYZER_PORT = int(os.getenv('ANALYZER_PORT', '4002'))
 NOTIFICATION_URL = os.getenv('NOTIFICATION_URL', f"http://localhost:{os.getenv('NOTIFICATION_PORT', '4003')}/api/notify")
 SPREAD_OFFSET = float(os.getenv('SPREAD_OFFSET', '0.0'))
 
-# Cooldown state per context timeframe (each TF trades independently)
-# Backtested: M5 -$53, M10 +$69, M15 +$61
-CONTEXT_TIMEFRAMES = ['10min', '15min']
-cooldowns_per_tf = {tf: CooldownState() for tf in CONTEXT_TIMEFRAMES}
+# R:R Slots — each signal opens trades at different risk/reward ratios
+# All use M15 context, each slot trades independently
+RR_SLOTS = [
+    {'name': 'A', 'tp_mult': 1.5, 'sl_mult': 0.5, 'label': '3:1'},
+    {'name': 'B', 'tp_mult': 2.5, 'sl_mult': 1.5, 'label': '1.7:1'},
+    {'name': 'C', 'tp_mult': 1.0, 'sl_mult': 1.0, 'label': '1:1'},
+]
+CONTEXT_TF = '15min'  # Single context TF for all slots
+cooldowns_per_slot = {s['name']: CooldownState() for s in RR_SLOTS}
 
 
 # ===================== NOTIFICATION HELPER =====================
@@ -145,7 +150,7 @@ def _get_today_trades(db):
     start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
     start_ms = int(start_of_day.timestamp() * 1000)
     trades = list(db.paper_trades.find(
-        {'entryTime': {'$gte': start_ms}}
+        {'entryTime': {'$gte': start_ms}, 'isArchived': {'$ne': True}}
     ).sort('entryTime', -1))
     return trades
 
@@ -242,12 +247,13 @@ def _normalize_tf(tf: str) -> str:
 
 
 def _group_trades_by_tf(trades):
-    """Group trades by timeframe, maintaining order."""
+    """Group trades by R:R slot (or legacy TF), maintaining order."""
     from collections import OrderedDict
-    tf_order = ['5M', '10M', '15M', '30M']
-    grouped = OrderedDict((tf, []) for tf in tf_order)
+    slot_order = [f"{s['name']}({s['label']})" for s in RR_SLOTS]
+    # Also keep legacy TF keys for old trades
+    grouped = OrderedDict((k, []) for k in slot_order)
     for t in trades:
-        tf = _normalize_tf(t.get('contextTf', 'M5'))
+        tf = _normalize_tf(t.get('contextTf', 'A(3:1)'))
         if tf not in grouped:
             grouped[tf] = []
         grouped[tf].append(t)
@@ -419,6 +425,95 @@ def _compute_macro_trend(db):
         return ('NEUTRAL', None)
 
 
+# === DYNAMIC SMART MODE (per-slot) ===
+_FALLBACK_REVERSE = {1, 2, 4, 5, 7, 8, 9, 10, 12, 17, 20, 21, 23}
+_sm_cache = {}           # {(slot_name, hour): 'NORMAL'|'REVERSE'}
+_sm_last_calc = 0        # last recalc timestamp
+_sm_last_notified = {}   # {slot_name: 'hour:mode'}
+SM_RECALC_SECS = 3600    # recalc every hour
+SM_MIN_TRADES = 5        # min trades/hour/slot to trust data
+
+def _compute_smart_mode(db):
+    """Analyze last 7 days of closed trades → NORMAL/REVERSE per slot per VNT hour."""
+    from datetime import datetime, timezone, timedelta
+    global _sm_cache, _sm_last_calc
+    now = time.time()
+    if now - _sm_last_calc < SM_RECALC_SECS and _sm_cache:
+        return
+    vnt = timezone(timedelta(hours=7))
+    week_ago_ms = int((now - 7 * 86400) * 1000)
+    closed = list(db.paper_trades.find({'status': 'CLOSED', 'entryTime': {'$gte': week_ago_ms}}))
+
+    slot_names = [s['name'] for s in RR_SLOTS]
+
+    if not closed:
+        for sn in slot_names:
+            for h in range(24):
+                _sm_cache[(sn, h)] = 'REVERSE' if h in _FALLBACK_REVERSE else 'NORMAL'
+        _sm_last_calc = now
+        print(f"[SmartMode] No data → fallback schedule (all slots)")
+        return
+
+    # Group PnL by (slot, hour)
+    hourly = {}
+    for sn in slot_names:
+        for h in range(24):
+            hourly[(sn, h)] = []
+
+    for t in closed:
+        ems = t.get('entryTime', 0)
+        if isinstance(ems, dict):
+            ems = ems.get('high', 0) * (2**32) + (ems.get('low', 0) % (2**32))
+        dt = datetime.fromtimestamp(ems / 1000, tz=vnt)
+        ctx = t.get('contextTf', '')
+        # Extract slot name: "A(3:1)" → "A"
+        sn = ctx.split('(')[0] if '(' in ctx else ctx
+        if sn not in slot_names:
+            continue  # legacy trade, skip
+        hourly[(sn, dt.hour)].append(t.get('pnl', 0))
+
+    changes = []
+    for sn in slot_names:
+        for h in range(24):
+            tr = hourly[(sn, h)]
+            if len(tr) >= SM_MIN_TRADES:
+                mode = 'REVERSE' if sum(tr) < 0 else 'NORMAL'
+            else:
+                mode = 'REVERSE' if h in _FALLBACK_REVERSE else 'NORMAL'
+            old = _sm_cache.get((sn, h))
+            if old and old != mode:
+                changes.append(f'{sn}@{h:02d} {old}→{mode}')
+            _sm_cache[(sn, h)] = mode
+
+    _sm_last_calc = now
+    for sn in slot_names:
+        nr = sum(1 for h in range(24) if _sm_cache.get((sn, h)) == 'REVERSE')
+        dh = sum(1 for h in range(24) if len(hourly[(sn, h)]) >= SM_MIN_TRADES)
+        print(f"[SmartMode] {sn}: {nr}/24h REV | {dh}/24 data-driven")
+    if changes:
+        print(f"[SmartMode] Changes: {', '.join(changes[:8])}")
+
+def _get_trade_mode(db, slot_name):
+    """Get NORMAL/REVERSE for current VNT hour + slot. Notify on switch."""
+    from datetime import datetime, timezone, timedelta
+    global _sm_last_notified
+    _compute_smart_mode(db)
+    vnt = timezone(timedelta(hours=7))
+    h = datetime.now(vnt).hour
+    mode = _sm_cache.get((slot_name, h), 'NORMAL')
+    key = f"{h}:{mode}"
+    prev = _sm_last_notified.get(slot_name)
+    if prev is not None and prev != key:
+        icon = '🔄' if mode == 'REVERSE' else '▶️'
+        slot_info = next((s for s in RR_SLOTS if s['name'] == slot_name), {})
+        label = f"{slot_name}({slot_info.get('label', '')})"
+        msg = f"{icon} <b>{label} → {mode}</b> (VNT {h:02d}:00)"
+        notify('MODE_SWITCH', None, msg)
+        print(f"[SmartMode] 📢 {label} → {mode} (VNT {h:02d}:00)")
+    _sm_last_notified[slot_name] = key
+    return mode, h
+
+
 def run_strategies(db):
     """Execute all strategies across all context timeframes. Called every 5s."""
     df_m1 = load_candles(db, SYMBOL, 500)  # Fast: only 500 bars for trading
@@ -429,79 +524,79 @@ def run_strategies(db):
     # Compute M1 indicators once (shared across all context TFs)
     df_m1 = attach_indicators(df_m1)
 
-    # === Macro trend (logged only, no blocking) ===
-    daily_trend, _ = _compute_macro_trend(db)
-    allowed_dir = None  # Disabled: allow both directions
+    # Build M15 context (single TF for all R:R slots)
+    tf_label = '15M'
+    df_ctx = resample_ohlcv(df_m1, CONTEXT_TF)
+    if len(df_ctx) < 4:
+        return
+    df_ctx = attach_indicators(df_ctx)
+    df_ctx_shifted = df_ctx.shift(1)
+    snap = build_snapshot(df_m1, df_ctx, df_ctx_shifted, db)
+    if snap is None:
+        return
 
-    for ctx_tf in CONTEXT_TIMEFRAMES:
-        tf_label = ctx_tf.upper().replace('MIN', 'M')  # '5min' → '5M'
+    now = time.time()
 
-        # Resample M1 → context TF
-        df_ctx = resample_ohlcv(df_m1, ctx_tf)
-        min_bars = max(20, 50 // int(ctx_tf.replace('min', '')))
-        if len(df_ctx) < min_bars:
-            continue  # Not enough data yet for this TF
-
-        df_ctx = attach_indicators(df_ctx)
-        df_ctx_shifted = df_ctx.shift(1)
-
-        # Build snapshot using this context TF
-        snap = build_snapshot(df_m1, df_ctx, df_ctx_shifted, db)
-        if snap is None:
-            continue
-
-        # Evaluate strategies with per-TF cooldowns
-        now = time.time()
-        cooldowns = cooldowns_per_tf[ctx_tf]
+    # Evaluate signals once, then execute across all R:R slots
+    for slot in RR_SLOTS:
+        trade_mode, hour_vnt = _get_trade_mode(db, slot['name'])
+        cooldowns = cooldowns_per_slot[slot['name']]
         signals = evaluate_strategies(snap, cooldowns, now, SPREAD_OFFSET)
+        slot_label = f"{slot['name']}({slot['label']})"
 
-        # Log M15 state every ~5 min when no signals
+        # Log state every ~5 min when no signals
         if not signals:
-            _ema_log_counter = getattr(run_strategies, f'_ema_log_{ctx_tf}', 0) + 1
-            setattr(run_strategies, f'_ema_log_{ctx_tf}', _ema_log_counter)
-            if _ema_log_counter % 60 == 1:  # every ~5 min (60 × 5s)
+            ctr = getattr(run_strategies, f'_log_{slot["name"]}', 0) + 1
+            setattr(run_strategies, f'_log_{slot["name"]}', ctr)
+            if ctr % 60 == 1 and slot['name'] == 'A':  # only log once
                 bull = snap.m5_ema9 > snap.m5_ema21 > snap.m5_ema50
                 bear = snap.m5_ema9 < snap.m5_ema21 < snap.m5_ema50
                 align = '🟢BULL' if bull else ('🔴BEAR' if bear else '⚪NEUTRAL')
-                print(f"[{tf_label}] {align} | EMA9:{snap.m5_ema9:.1f} EMA21:{snap.m5_ema21:.1f} EMA50:{snap.m5_ema50:.1f} | RSI:{snap.m1_rsi:.0f} | No signals")
+                print(f"[15M] {align} | EMA9:{snap.m5_ema9:.1f} EMA21:{snap.m5_ema21:.1f} EMA50:{snap.m5_ema50:.1f} | RSI:{snap.m1_rsi:.0f} | No signals")
 
-        # Execute signals (H4 trend filter: hard block counter-trend)
+        # Execute signals per slot with its own TP/SL
         for sig in signals:
-            if allowed_dir and sig.direction != allowed_dir:
-                print(f"[Trend] ⛔ BLOCKED {sig.direction} {sig.strategy} on {tf_label} | H4={daily_trend}")
-                continue
+            atr = snap.m5_atr
+            tp_dist = atr * slot['tp_mult']
+            sl_dist = atr * slot['sl_mult']
 
-            # === REVERSE MODE: flip direction, swap TP↔SL ===
-            rev_dir = 'SHORT' if sig.direction == 'LONG' else 'LONG'
-            rev_tp = sig.sl   # old SL becomes new TP
-            rev_sl = sig.tp   # old TP becomes new SL
+            if trade_mode == 'REVERSE':
+                exec_dir = 'SHORT' if sig.direction == 'LONG' else 'LONG'
+            else:
+                exec_dir = sig.direction
+
+            if exec_dir == 'LONG':
+                exec_tp = sig.entry_price + tp_dist
+                exec_sl = sig.entry_price - sl_dist
+            else:
+                exec_tp = sig.entry_price - tp_dist
+                exec_sl = sig.entry_price + sl_dist
 
             trade_doc = {
-                'symbol': SYMBOL, 'direction': rev_dir, 'status': 'OPEN',
+                'symbol': SYMBOL, 'direction': exec_dir, 'status': 'OPEN',
                 'entryPrice': round(sig.entry_price, 3),
-                'tp': round(rev_tp, 3), 'sl': round(rev_sl, 3),
+                'tp': round(exec_tp, 3), 'sl': round(exec_sl, 3),
                 'entryTime': int(now * 1000),
                 'signalType': sig.strategy, 'meta': sig.meta, 'lotSize': LOT_SIZE,
-                'contextTf': tf_label, 'dailyTrend': daily_trend,
+                'contextTf': slot_label, 'tradeMode': trade_mode, 'isArchived': False,
             }
             db.paper_trades.insert_one(trade_doc)
 
-            # Notification (reversed)
-            arrow = '↑' if rev_dir == 'LONG' else '↓'
-            trend_icon = '📈' if daily_trend == 'UP' else '📉'
-            tp_dist = abs(rev_tp - sig.entry_price)
-            sl_dist = abs(rev_sl - sig.entry_price)
+            # Notification
+            arrow = '↑' if exec_dir == 'LONG' else '↓'
+            mode_tag = '🔄' if trade_mode == 'REVERSE' else '▶️'
             rsi = sig.meta.get('m1_rsi', 0)
             if sig.strategy == 'BB_REVERSION':
                 rsi_cond = '≤25' if sig.direction == 'LONG' else '≥75'
             else:
                 rsi_cond = '≤45' if sig.direction == 'LONG' else '≥55'
-            header = f"{trend_icon}{arrow} <b>NEW {tf_label} {rev_dir} ${sig.entry_price:.2f} | RSI {rsi:.0f} ({rsi_cond}) | TP +${tp_dist:.1f} | SL -${sl_dist:.1f}</b>"
+            header = f"{mode_tag}{arrow} <b>NEW {slot_label} {exec_dir} ${sig.entry_price:.2f} | RSI {rsi:.0f} ({rsi_cond}) | TP +${tp_dist:.1f} | SL -${sl_dist:.1f}</b>"
 
             live = get_live_price(db) or sig.entry_price
-            msg = build_tf_message(header, db, tf=tf_label, live_price=live)
+            msg = build_tf_message(header, db, tf=slot_label, live_price=live)
             notify('TRADE_OPEN', None, msg, trade_doc)
-            print(f"[{sig.strategy}·{tf_label}] REVERSED {sig.direction}→{rev_dir} at {sig.entry_price:.3f} | TP: {rev_tp:.3f} | SL: {rev_sl:.3f}")
+            rev_tag = f" REV {sig.direction}→{exec_dir}" if trade_mode == 'REVERSE' else ''
+            print(f"[{sig.strategy}·{slot_label}] {exec_dir}{rev_tag} at {sig.entry_price:.3f} | TP: {exec_tp:.3f} | SL: {exec_sl:.3f} [{trade_mode}]")
 
 
 # ===================== REAL-TIME BROADCAST =====================
@@ -515,7 +610,7 @@ def get_frontend_payload(db):
     start_ms = int(start_of_day.timestamp() * 1000)
 
     trades = list(db.paper_trades.find(
-        {'entryTime': {'$gte': start_ms}}
+        {'entryTime': {'$gte': start_ms}, 'isArchived': {'$ne': True}}
     ).sort('entryTime', -1))
     for t in trades:
         t['_id'] = str(t['_id'])
