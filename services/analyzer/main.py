@@ -193,24 +193,12 @@ def _build_trade_list(trades, live_price):
             r = t.get('redTicks', 0)
             timeline = ['G'] * g + ['R'] * r  # fallback (not chronological)
 
-        # Timeline: replace 🟩🟥 with ↑↓
+        # Timeline: just percentage
         if timeline:
             total_ticks = len(timeline)
             green_count = sum(1 for c in timeline if c == 'G')
             green_pct = green_count / total_ticks * 100
-
-            bar_len = 8
-            tl = ''
-            for i in range(bar_len):
-                start = int(i * total_ticks / bar_len)
-                end = int((i + 1) * total_ticks / bar_len)
-                segment = timeline[start:end]
-                if segment:
-                    seg_green = sum(1 for c in segment if c == 'G')
-                    tl += '↑' if seg_green >= len(segment) / 2 else '↓'
-                else:
-                    tl += '-'
-            tl_str = f'{tl} {green_pct:.0f}%'
+            tl_str = f'{green_pct:.0f}%'
         else:
             tl_str = ''
 
