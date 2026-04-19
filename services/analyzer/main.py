@@ -449,7 +449,7 @@ _SM_DECAY_SECS = 1800   # Start decaying score after 30 min without trades
 _edge_scores = {}       # {slot_name: float}  EMA score in [-1, +1]
 _current_modes = {}     # {slot_name: str}    active NORMAL/REVERSE
 _seen_trade_ids = {}    # {slot_name: set}    already-processed trade IDs
-_sm_last_notified = {}  # {slot_name: str}    "hour:mode" for dedup
+_sm_last_notified = {}  # {slot_name: str}    last notified mode for dedup
 _sm_last_update = {}    # {slot_name: float}  timestamp of last EMA update
 
 
@@ -528,19 +528,18 @@ def _get_trade_mode(db, slot_name):
     else:
         new_mode = _current_modes[slot_name]  # hysteresis: keep current
 
-    # 5. Notify on mode switch
+    # 5. Notify only on actual mode change (not every hour)
     vnt = timezone(timedelta(hours=7))
     h = datetime.now(vnt).hour
-    key = f"{h}:{new_mode}"
     prev = _sm_last_notified.get(slot_name)
-    if prev is not None and prev != key:
+    if prev is not None and prev != new_mode:
         icon = '🔄' if new_mode == 'REVERSE' else '▶️'
         slot_info = next((s for s in RR_SLOTS if s['name'] == slot_name), {})
         label = f"{slot_name}({slot_info.get('label', '')})"
         msg = f"{icon} <b>{label} → {new_mode}</b> (score: {score:+.2f} | VNT {h:02d}:00)"
         notify('MODE_SWITCH', None, msg)
         print(f"[SmartMode] 📢 {label} → {new_mode} (score: {score:+.2f} | VNT {h:02d}:00)")
-    _sm_last_notified[slot_name] = key
+    _sm_last_notified[slot_name] = new_mode
 
     _current_modes[slot_name] = new_mode
 
