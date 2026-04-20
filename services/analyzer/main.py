@@ -614,15 +614,14 @@ def run_strategies(db):
             else:
                 exec_dir = sig.direction
 
-            # --- GUARD 1: H1 macro trend filter ---
-            # Prevents consecutive trades going in opposite directions.
-            # If H1 EMA9 > EMA21 → only LONG allowed; vice versa.
-            macro_trend, allowed_dir = _compute_macro_trend(db)
-            if allowed_dir and exec_dir != allowed_dir:
-                # Restore cooldown — don't waste it on a blocked signal
-                _restore_cooldown(cooldowns, sig.strategy, saved_cd)
-                print(f"[{sig.strategy}·{slot_label}] ⛔ H1 trend {macro_trend} blocks {exec_dir} (only {allowed_dir} allowed)")
-                continue
+            # --- GUARD 1: H1 macro trend filter (DISABLED) ---
+            # Too aggressive — H1 EMAs lag behind short-term reversals,
+            # blocking valid signals for hours. Re-enable after tuning.
+            # macro_trend, allowed_dir = _compute_macro_trend(db)
+            # if allowed_dir and exec_dir != allowed_dir:
+            #     _restore_cooldown(cooldowns, sig.strategy, saved_cd)
+            #     print(f"[{sig.strategy}·{slot_label}] ⛔ H1 trend {macro_trend} blocks {exec_dir} (only {allowed_dir} allowed)")
+            #     continue
 
             # --- GUARD 2: Duplicate price guard ($5 minimum distance) ---
             # Don't open same-slot trade if an existing OPEN trade is within $5.
