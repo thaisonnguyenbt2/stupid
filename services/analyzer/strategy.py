@@ -70,6 +70,8 @@ class MarketSnapshot:
     m5_ema50: float
     m5_rsi: float
     m5_close: float
+    m5_high: float
+    m5_low: float
     m5_upper_bb: float
     m5_lower_bb: float
     m5_volume: float
@@ -288,23 +290,24 @@ def evaluate_strategies(
             return price - tp_dist, price + sl_dist
 
     # ==================== STRATEGY A: EMA Trend Pullback ====================
+    # M5-only trigger: M5 trend alignment + M5 pullback to M5 EMA21 + M5 RSI reset
     if now - cooldowns.last_ema > COOLDOWN_SECS:
         m5_bull = snap.m5_ema9 > snap.m5_ema21 > snap.m5_ema50
         m5_bear = snap.m5_ema9 < snap.m5_ema21 < snap.m5_ema50
 
         full_dir = None
-        if m5_bull and snap.m1_low <= snap.m1_ema21 and snap.m1_rsi <= 45:
+        if m5_bull and snap.m5_low <= snap.m5_ema21 and snap.m5_rsi <= 55:
             full_dir = 'LONG'
-        elif m5_bear and snap.m1_high >= snap.m1_ema21 and snap.m1_rsi >= 55:
+        elif m5_bear and snap.m5_high >= snap.m5_ema21 and snap.m5_rsi >= 45:
             full_dir = 'SHORT'
 
         if full_dir and not check_counter_trend(full_dir):
             cooldowns.last_ema = now
             tp, sl = calc_tp_sl(full_dir, EMA_TP_MULT, EMA_SL_MULT)
             meta = {
-                'rule': f"M5 EMA {'9>21>50 BULL' if m5_bull else '9<21<50 BEAR'}, M1 pullback to EMA21, M1 RSI reset",
+                'rule': f"M5 EMA {'9>21>50 BULL' if m5_bull else '9<21<50 BEAR'}, M5 pullback to EMA21, M5 RSI reset",
                 'm1_rsi': round(snap.m1_rsi, 2),
-                'm1_ema21': round(snap.m1_ema21, 3),
+                'm5_rsi': round(snap.m5_rsi, 2),
                 'm5_ema9': round(snap.m5_ema9, 3),
                 'm5_ema21': round(snap.m5_ema21, 3),
                 'm5_ema50': round(snap.m5_ema50, 3),

@@ -290,7 +290,6 @@ def build_tf_message(header: str, db, tf: str, live_price=None) -> str:
     Telegram max: 4096 characters.
     """
     today_trades = _get_today_trades(db)
-    overall_footer = _build_daily_footer(today_trades)
     tf_normalized = _normalize_tf(tf)
 
     # Filter trades for this TF only
@@ -307,10 +306,6 @@ def build_tf_message(header: str, db, tf: str, live_price=None) -> str:
         parts.append(f"━━━ {tf_normalized} ━━━")
         parts.append('<i>No trades yet</i>')
 
-    parts.append('──────────')
-    parts.append(overall_footer)
-    parts.append('')
-    parts.append('━━━━━━oOo━━━━━━')
     parts.append('')
     return '\n'.join(parts)
 
@@ -383,6 +378,8 @@ def build_snapshot(df_m1, df_m5, df_m5_shifted, db) -> MarketSnapshot:
         m5_ema50=m5['ema50'],
         m5_rsi=m5['rsi'],
         m5_close=m5['close'],
+        m5_high=m5['high'],
+        m5_low=m5['low'],
         m5_upper_bb=m5['upper_bb'],
         m5_lower_bb=m5['lower_bb'],
         m5_volume=m5['volume'],
