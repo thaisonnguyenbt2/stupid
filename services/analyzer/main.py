@@ -456,10 +456,8 @@ _sm_last_update = {}    # {slot_name: float}  timestamp of last EMA update
 
 
 def _session_default_mode():
-    """NORMAL during NY session, REVERSE otherwise (VNT)."""
-    from datetime import datetime, timezone, timedelta
-    h = datetime.now(timezone(timedelta(hours=7))).hour
-    return 'NORMAL' if h in _NY_HOURS_VNT else 'REVERSE'
+    """Default mode for cold start: NORMAL for all market times."""
+    return 'NORMAL'
 
 
 def _get_trade_mode(db, slot_name):

@@ -10,7 +10,7 @@ dotenv.config({ path: path.join(__dirname, '..', '..', '..', '.env') });
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
 
 const PORT = process.env.NOTIFICATION_PORT || 4003;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
