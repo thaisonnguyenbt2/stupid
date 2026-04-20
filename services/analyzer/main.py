@@ -501,7 +501,14 @@ def _get_trade_mode(db, slot_name):
         if tid in _seen_trade_ids[slot_name]:
             continue
         _seen_trade_ids[slot_name].add(tid)
-        outcome = +1.0 if t.get('pnl', 0) > 0 else -1.0
+        is_win = t.get('pnl', 0) > 0
+        # Mode-aware scoring: score tracks whether NORMAL direction works.
+        # NORMAL win → +1 (NORMAL works), NORMAL loss → -1 (try REVERSE)
+        # REVERSE win → -1 (NORMAL would lose), REVERSE loss → +1 (try NORMAL back)
+        if t.get('tradeMode') == 'REVERSE':
+            outcome = -1.0 if is_win else +1.0
+        else:
+            outcome = +1.0 if is_win else -1.0
         _edge_scores[slot_name] = (1 - _SM_ALPHA) * _edge_scores[slot_name] + _SM_ALPHA * outcome
         _sm_last_update[slot_name] = now
         new_count += 1
