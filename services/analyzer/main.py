@@ -206,6 +206,8 @@ def _build_trade_list(trades, live_price):
 
 
 
+        mode_letter = 'R' if t.get('tradeMode') == 'REVERSE' else 'N'
+
         if status == 'CLOSED':
             is_win = t.get('pnl', 0) > 0
             arrow = _dir_arrow(direction, is_win)
@@ -217,7 +219,7 @@ def _build_trade_list(trades, live_price):
             dur_mins = (exit_time_raw - entry_time_raw) / 60000 if exit_time_raw and entry_time_raw else 0
             dur_str = f'{int(dur_mins//60)}h{int(dur_mins%60)}m' if dur_mins >= 60 else f'{int(dur_mins)}m'
 
-            line = f"{arrow} {entry_time} | {low:+.1f} {entry:.0f} {peak:+.1f} | {dur_str}"
+            line = f"{arrow} ({mode_letter}) {entry_time} | {low:+.1f} {entry:.0f} {peak:+.1f} | {dur_str}"
             lines.append(f"<i>{line}</i>")
         else:
             # Active
@@ -227,7 +229,7 @@ def _build_trade_list(trades, live_price):
             dur_mins = (time.time() * 1000 - entry_time_raw) / 60000 if entry_time_raw else 0
             dur_str = f'{int(dur_mins//60)}h{int(dur_mins%60)}m' if dur_mins >= 60 else f'{int(dur_mins)}m'
 
-            line = f"{arrow} {entry_time} | {low:+.1f} {entry:.0f} {peak:+.1f} | {dur_str}"
+            line = f"{arrow} ({mode_letter}) {entry_time} | {low:+.1f} {entry:.0f} {peak:+.1f} | {dur_str}"
             lines.append(f"<b>{line}</b>")
 
     return lines
