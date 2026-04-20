@@ -25,7 +25,7 @@ import pandas as pd
 
 # ===================== CONSTANTS =====================
 
-COOLDOWN_SECS = 600        # 10 minutes
+COOLDOWN_SECS = 180        # 3 minutes
 ATR_MIN = 0.05             # Dead-market guard
 LOT_SIZE = 0.01
 CONTRACT_SIZE = 100        # 1 lot = 100 troy oz
