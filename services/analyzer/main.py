@@ -658,13 +658,13 @@ def run_strategies(db):
 
             # Notification
             arrow = '↑' if exec_dir == 'LONG' else '↓'
-            mode_tag = '🔄' if trade_mode == 'REVERSE' else '▶️'
+            mode_letter = 'R' if trade_mode == 'REVERSE' else 'N'
             rsi = sig.meta.get('m1_rsi', 0)
             if sig.strategy == 'BB_REVERSION':
                 rsi_cond = '≤25' if sig.direction == 'LONG' else '≥75'
             else:
                 rsi_cond = '≤45' if sig.direction == 'LONG' else '≥55'
-            header = f"{mode_tag}{arrow} <b>NEW {slot_label} {exec_dir} ${sig.entry_price:.2f} | RSI {rsi:.0f} ({rsi_cond}) | TP +${tp_dist:.1f} | SL -${sl_dist:.1f}</b>"
+            header = f"{arrow} ({mode_letter}) <b>NEW {slot_label} {exec_dir} ${sig.entry_price:.2f} | RSI {rsi:.0f} ({rsi_cond}) | TP +${tp_dist:.1f} | SL -${sl_dist:.1f}</b>"
 
             live = get_live_price(db) or sig.entry_price
             msg = build_tf_message(header, db, tf=slot_label, live_price=live)
@@ -811,7 +811,8 @@ def monitor_trades(db):
                         tl_bar += '⬜'
                 tl_bar = f' {tl_bar} {green_pct:.0f}%'
 
-            header = f"{arrow_icon} <b>CLOSED {ctx_tf} {pnl_str} | ${entry:.2f} → ${live_price:.2f} | {hold_mins:.0f}m</b>{tl_bar}"
+            trade_mode_letter = 'R' if trade.get('tradeMode') == 'REVERSE' else 'N'
+            header = f"{arrow_icon} ({trade_mode_letter}) <b>CLOSED {ctx_tf} {pnl_str} | ${entry:.2f} → ${live_price:.2f} | {hold_mins:.0f}m</b>{tl_bar}"
 
             msg = build_tf_message(header, db, tf=ctx_tf, live_price=live_price)
             slot_key = ctx_tf.split('(')[0] if '(' in ctx_tf else ''
