@@ -48,6 +48,16 @@ ANALYZER_PORT = int(os.getenv('ANALYZER_PORT', '4002'))
 NOTIFICATION_URL = os.getenv('NOTIFICATION_URL', f"http://localhost:{os.getenv('NOTIFICATION_PORT', '4003')}/api/notify")
 SPREAD_OFFSET = float(os.getenv('SPREAD_OFFSET', '0.0'))
 
+# Capital.com live trading
+CAPITAL_LIVE_ENABLED = os.getenv('CAPITAL_LIVE_ENABLED', 'false').lower() == 'true'
+CAPITAL_API_KEY = os.getenv('CAPITAL_API_KEY', '')
+CAPITAL_API_PASSWORD = os.getenv('CAPITAL_API_PASSWORD', '')
+CAPITAL_EMAIL = os.getenv('CAPITAL_EMAIL', '')
+CAPITAL_DEMO = os.getenv('CAPITAL_DEMO', 'true').lower() != 'false'  # Default to demo
+CAPITAL_BASE_URL = 'https://demo-api-capital.backend-capital.com/api/v1' if CAPITAL_DEMO \
+    else 'https://api-capital.backend-capital.com/api/v1'
+CAPITAL_EPIC = 'GOLD'  # XAU/USD on Capital.com
+
 # R:R Slots — each signal opens trades at different risk/reward ratios
 # All use M15 context, each slot trades independently
 RR_SLOTS = [
@@ -59,8 +69,8 @@ CONTEXT_TF = '15min'  # Single context TF for all slots
 cooldowns_per_slot = {s['name']: CooldownState() for s in RR_SLOTS}
 
 # Slot → Telegram chat routing
-# C (1:1 R:R) → CHAT_ID_2 | B (1.7:1 R:R) → CHAT_ID_3 | A (3:1) → default
-SLOT_CHAT_MAP = {'C': '2', 'B': '3'}
+# B (1.7:1 R:R — live traded) → default CHAT_ID | C (1:1) → CHAT_ID_2 | A (3:1) → CHAT_ID_3
+SLOT_CHAT_MAP = {'C': '2', 'A': '3'}
 
 
 # ===================== NOTIFICATION HELPER =====================
@@ -94,6 +104,128 @@ def notify(type_: str, title: str, message: str, trade: dict = None, target_chat
     except Exception as e:
         notify_fail_count += 1
         print(f"[Notify] ❌ {type(e).__name__}: {e} (fail #{notify_fail_count})")
+
+
+# ===================== CAPITAL.COM TRADE CLIENT =====================
+
+class CapitalClient:
+    """Thin REST client for Capital.com trade execution."""
+
+    def __init__(self):
+        self.cst = None
+        self.security_token = None
+        self.last_session_time = 0
+        self.max_positions = 6
+        self.max_spread = 3.0  # USD — reject if spread > $3
+
+    def _ensure_session(self):
+        """Create or refresh session (expires every 10 min)."""
+        if time.time() - self.last_session_time > 540:  # Refresh at 9 min
+            try:
+                resp = requests.post(f"{CAPITAL_BASE_URL}/session",
+                    headers={
+                        'X-CAP-API-KEY': CAPITAL_API_KEY,
+                        'Content-Type': 'application/json',
+                    },
+                    json={
+                        'identifier': CAPITAL_EMAIL,
+                        'password': CAPITAL_API_PASSWORD,
+                        'encryptedPassword': False,
+                    },
+                    timeout=10,
+                )
+                if resp.status_code == 200:
+                    self.cst = resp.headers.get('CST')
+                    self.security_token = resp.headers.get('X-SECURITY-TOKEN')
+                    self.last_session_time = time.time()
+                    print(f"[Capital] ✅ Session created ({'DEMO' if CAPITAL_DEMO else 'LIVE'})")
+                else:
+                    print(f"[Capital] ❌ Session failed: HTTP {resp.status_code} — {resp.text[:200]}")
+            except Exception as e:
+                print(f"[Capital] ❌ Session error: {e}")
+
+    @property
+    def headers(self):
+        self._ensure_session()
+        return {
+            'X-CAP-API-KEY': CAPITAL_API_KEY,
+            'CST': self.cst or '',
+            'X-SECURITY-TOKEN': self.security_token or '',
+            'Content-Type': 'application/json',
+        }
+
+    def open_trade(self, direction: str, lot_size: float, tp: float, sl: float,
+                   strategy: str = '', slot: str = '') -> dict:
+        """Open a real trade on Capital.com. Returns result dict or error."""
+        if not self.cst:
+            self._ensure_session()
+        if not self.cst:
+            return {'error': 'No session'}
+
+        try:
+            # Safety: check position count
+            pos_resp = requests.get(f"{CAPITAL_BASE_URL}/positions", headers=self.headers, timeout=10)
+            if pos_resp.status_code == 200:
+                positions = pos_resp.json().get('positions', [])
+                if len(positions) >= self.max_positions:
+                    print(f"[Capital] ⛔ Max positions ({self.max_positions}) reached — skipping")
+                    return {'error': f'Max positions ({self.max_positions}) reached'}
+
+            # Execute
+            order_data = {
+                'epic': CAPITAL_EPIC,
+                'direction': 'BUY' if direction == 'LONG' else 'SELL',
+                'size': lot_size,
+                'guaranteedStop': False,
+                'stopLevel': round(sl, 2),
+                'profitLevel': round(tp, 2),
+            }
+            resp = requests.post(f"{CAPITAL_BASE_URL}/positions",
+                headers=self.headers, json=order_data, timeout=10)
+            result = resp.json()
+
+            if resp.status_code in (200, 201):
+                deal_ref = result.get('dealReference', '')
+                # Confirm the deal
+                if deal_ref:
+                    confirm_resp = requests.get(f"{CAPITAL_BASE_URL}/confirms/{deal_ref}",
+                        headers=self.headers, timeout=10)
+                    if confirm_resp.status_code == 200:
+                        confirm = confirm_resp.json()
+                        status = confirm.get('dealStatus', 'UNKNOWN')
+                        print(f"[Capital] ✅ {direction} {lot_size} GOLD | Deal: {deal_ref} | Status: {status}")
+                        return {'dealReference': deal_ref, 'status': status, 'confirm': confirm}
+                    else:
+                        print(f"[Capital] ⚠️ Confirm failed: {confirm_resp.text[:200]}")
+
+                print(f"[Capital] ✅ Order sent: {deal_ref}")
+                return {'dealReference': deal_ref, 'result': result}
+            else:
+                print(f"[Capital] ❌ Order failed: HTTP {resp.status_code} — {resp.text[:200]}")
+                return {'error': resp.text[:200]}
+
+        except Exception as e:
+            print(f"[Capital] ❌ Trade error: {e}")
+            return {'error': str(e)}
+
+    def get_positions(self) -> list:
+        """Get all open positions."""
+        try:
+            resp = requests.get(f"{CAPITAL_BASE_URL}/positions", headers=self.headers, timeout=10)
+            if resp.status_code == 200:
+                return resp.json().get('positions', [])
+        except Exception as e:
+            print(f"[Capital] ❌ Get positions error: {e}")
+        return []
+
+
+# Initialize Capital.com client (lazy — session created on first use)
+capital_client = CapitalClient() if CAPITAL_LIVE_ENABLED else None
+if CAPITAL_LIVE_ENABLED:
+    mode = 'DEMO' if CAPITAL_DEMO else '🔴 LIVE'
+    print(f"[Capital] ✅ Live trading ENABLED ({mode}) — epic: {CAPITAL_EPIC}")
+else:
+    print(f"[Capital] Live trading DISABLED (paper only)")
 
 
 # ===================== DATA LOADING =====================
@@ -537,14 +669,35 @@ def run_strategies(db):
             }
             db.paper_trades.insert_one(trade_doc)
 
+            # === Capital.com LIVE trade execution (Slot B only: TP 2.5×ATR / SL 1.5×ATR) ===
+            if capital_client and slot['name'] == 'B':
+                cap_result = capital_client.open_trade(
+                    direction=exec_dir,
+                    lot_size=LOT_SIZE,
+                    tp=exec_tp,
+                    sl=exec_sl,
+                    strategy=sig.strategy,
+                    slot=slot_label,
+                )
+                # Store deal reference in paper trade for tracking
+                if cap_result.get('dealReference'):
+                    db.paper_trades.update_one(
+                        {'_id': trade_doc['_id']},
+                        {'$set': {
+                            'capitalDealRef': cap_result['dealReference'],
+                            'capitalStatus': cap_result.get('status', 'SENT'),
+                        }}
+                    )
+
             # Notification
             arrow = '↑' if exec_dir == 'LONG' else '↓'
             rsi = sig.meta.get('m1_rsi', 0)
             if sig.strategy == 'BB_REVERSION':
                 rsi_cond = '≤25' if sig.direction == 'LONG' else '≥75'
             else:
-                rsi_cond = '≤45' if sig.direction == 'LONG' else '≥55'
-            header = f"{arrow} <b>NEW {slot_label} {exec_dir} ${sig.entry_price:.2f} | RSI {rsi:.0f} ({rsi_cond}) | TP +${tp_dist:.1f} | SL -${sl_dist:.1f}</b>"
+                rsi_cond = '≤55' if sig.direction == 'LONG' else '≥45'
+            live_tag = ' 🔴LIVE' if capital_client else ''
+            header = f"{arrow} <b>NEW {slot_label} {exec_dir} ${sig.entry_price:.2f} | RSI {rsi:.0f} ({rsi_cond}) | TP +${tp_dist:.1f} | SL -${sl_dist:.1f}{live_tag}</b>"
 
             live = get_live_price(db) or sig.entry_price
             msg = build_tf_message(header, db, tf=slot_label, live_price=live)

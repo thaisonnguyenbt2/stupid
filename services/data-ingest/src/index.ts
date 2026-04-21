@@ -3,7 +3,7 @@ import mongoose from 'mongoose';
 import cors from 'cors';
 import * as http from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
-import { startFinnhubStream } from './finnhub';
+import { startCapitalStream } from './capital';
 import { bootstrapHistoricalData, startTwelveDataCron } from './twelvedata';
 import { Candle } from './models/Candle';
 import * as dotenv from 'dotenv';
@@ -63,8 +63,8 @@ async function main() {
     // Start TwelveData 60s CRON
     startTwelveDataCron(SYMBOL);
 
-    // Start Finnhub live WebSocket
-    await startFinnhubStream(SYMBOL, broadcast);
+    // Start Capital.com live WebSocket (replaces Finnhub)
+    await startCapitalStream(SYMBOL, broadcast);
 
     // REST API
     app.get('/health', (_req, res) => res.send('OK'));
