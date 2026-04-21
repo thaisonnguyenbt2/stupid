@@ -667,9 +667,9 @@ def run_strategies(db):
                 'signalType': sig.strategy, 'meta': sig.meta, 'lotSize': LOT_SIZE,
                 'contextTf': slot_label, 'tradeMode': 'NORMAL', 'isArchived': False,
             }
-            db.paper_trades.insert_one(trade_doc)
 
             # === Capital.com LIVE trade execution (Slot B only: TP 2.5×ATR / SL 1.5×ATR) ===
+            # Order: API call first → confirm → then record paper trade
             if capital_client and slot['name'] == 'B':
                 cap_result = capital_client.open_trade(
                     direction=exec_dir,
@@ -679,15 +679,22 @@ def run_strategies(db):
                     strategy=sig.strategy,
                     slot=slot_label,
                 )
-                # Store deal reference in paper trade for tracking
-                if cap_result.get('dealReference'):
-                    db.paper_trades.update_one(
-                        {'_id': trade_doc['_id']},
-                        {'$set': {
-                            'capitalDealRef': cap_result['dealReference'],
-                            'capitalStatus': cap_result.get('status', 'SENT'),
-                        }}
-                    )
+                if cap_result.get('error'):
+                    # API failed — skip this trade entirely
+                    _restore_cooldown(cooldowns, sig.strategy, saved_cd)
+                    print(f"[{sig.strategy}·{slot_label}] ⛔ Capital.com rejected: {cap_result['error']}")
+                    continue
+
+                # API confirmed — enrich paper trade with deal reference
+                trade_doc['capitalDealRef'] = cap_result.get('dealReference', '')
+                trade_doc['capitalStatus'] = cap_result.get('status', 'SENT')
+                # Use actual fill price if available
+                confirm = cap_result.get('confirm', {})
+                if confirm.get('level'):
+                    trade_doc['entryPrice'] = round(confirm['level'], 3)
+
+            # Record paper trade (after Capital.com confirmation for Slot B)
+            db.paper_trades.insert_one(trade_doc)
 
             # Notification
             arrow = '↑' if exec_dir == 'LONG' else '↓'
@@ -696,14 +703,14 @@ def run_strategies(db):
                 rsi_cond = '≤25' if sig.direction == 'LONG' else '≥75'
             else:
                 rsi_cond = '≤55' if sig.direction == 'LONG' else '≥45'
-            live_tag = ' 🔴LIVE' if capital_client else ''
-            header = f"{arrow} <b>NEW {slot_label} {exec_dir} ${sig.entry_price:.2f} | RSI {rsi:.0f} ({rsi_cond}) | TP +${tp_dist:.1f} | SL -${sl_dist:.1f}{live_tag}</b>"
+            live_tag = ' 🔴LIVE' if (capital_client and slot['name'] == 'B') else ''
+            header = f"{arrow} <b>NEW {slot_label} {exec_dir} ${trade_doc['entryPrice']:.2f} | RSI {rsi:.0f} ({rsi_cond}) | TP +${tp_dist:.1f} | SL -${sl_dist:.1f}{live_tag}</b>"
 
             live = get_live_price(db) or sig.entry_price
             msg = build_tf_message(header, db, tf=slot_label, live_price=live)
             target_chat = SLOT_CHAT_MAP.get(slot['name'])
             notify('TRADE_OPEN', None, msg, trade_doc, target_chat=target_chat)
-            print(f"[{sig.strategy}·{slot_label}] {exec_dir} at {sig.entry_price:.3f} | TP: {exec_tp:.3f} | SL: {exec_sl:.3f}")
+            print(f"[{sig.strategy}·{slot_label}] {exec_dir} at {trade_doc['entryPrice']:.3f} | TP: {exec_tp:.3f} | SL: {exec_sl:.3f}")
 
 
 # ===================== REAL-TIME BROADCAST =====================
