@@ -321,25 +321,25 @@ def evaluate_strategies(
                 entry_price=price, tp=tp, sl=sl, meta=meta,
             ))
 
-    # ==================== STRATEGY B: Bollinger Mean Reversion ====================
+    # ==================== STRATEGY B: Bollinger Mean Reversion (M5) ====================
     if now - cooldowns.last_bb > COOLDOWN_SECS:
         full_dir = None
         bb_trigger = ''
-        if snap.m1_high > snap.m1_upper_bb and snap.m1_rsi >= 75:
+        if snap.m5_high > snap.m5_upper_bb and snap.m5_rsi >= 70:
             full_dir = 'SHORT'
-            bb_trigger = f"M1 High ({snap.m1_high:.3f}) > Upper BB ({snap.m1_upper_bb:.3f}), RSI {snap.m1_rsi:.1f} >= 75"
-        elif snap.m1_low < snap.m1_lower_bb and snap.m1_rsi <= 25:
+            bb_trigger = f"M5 High ({snap.m5_high:.3f}) > M5 Upper BB ({snap.m5_upper_bb:.3f}), M5 RSI {snap.m5_rsi:.1f} >= 70"
+        elif snap.m5_low < snap.m5_lower_bb and snap.m5_rsi <= 30:
             full_dir = 'LONG'
-            bb_trigger = f"M1 Low ({snap.m1_low:.3f}) < Lower BB ({snap.m1_lower_bb:.3f}), RSI {snap.m1_rsi:.1f} <= 25"
+            bb_trigger = f"M5 Low ({snap.m5_low:.3f}) < M5 Lower BB ({snap.m5_lower_bb:.3f}), M5 RSI {snap.m5_rsi:.1f} <= 30"
 
         if full_dir and not check_counter_trend(full_dir):
             cooldowns.last_bb = now
             tp, sl = calc_tp_sl(full_dir, BB_TP_MULT, BB_SL_MULT)
             meta = {
                 'rule': bb_trigger,
-                'm1_rsi': round(snap.m1_rsi, 2),
-                'm1_upper_bb': round(snap.m1_upper_bb, 3),
-                'm1_lower_bb': round(snap.m1_lower_bb, 3),
+                'm5_rsi': round(snap.m5_rsi, 2),
+                'm5_upper_bb': round(snap.m5_upper_bb, 3),
+                'm5_lower_bb': round(snap.m5_lower_bb, 3),
                 'm5_atr': round(snap.m5_atr, 3),
                 'tp_mult': BB_TP_MULT,
                 'sl_mult': BB_SL_MULT,
