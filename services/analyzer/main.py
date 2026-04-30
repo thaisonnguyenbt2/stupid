@@ -69,8 +69,8 @@ CONTEXT_TF = '15min'  # Single context TF for all slots
 cooldowns_per_slot = {s['name']: CooldownState() for s in RR_SLOTS}
 
 # Slot → Telegram chat routing
-# B (1.7:1 R:R — live traded) → default CHAT_ID | C (1:1) → CHAT_ID_2 | A (3:1) → CHAT_ID_3
-SLOT_CHAT_MAP = {'C': '2', 'A': '3'}
+# C (1:1 R:R — live traded) → default CHAT_ID | B (1.5:1) → CHAT_ID_2 | A (3:1) → CHAT_ID_3
+SLOT_CHAT_MAP = {'B': '2', 'A': '3'}
 
 
 # ===================== NOTIFICATION HELPER =====================
@@ -655,9 +655,9 @@ def run_strategies(db):
                 'contextTf': slot_label, 'tradeMode': 'NORMAL', 'isArchived': False,
             }
 
-            # === Capital.com LIVE trade execution (Slot B: TP 1.5×ATR / SL 1.0×ATR) ===
+            # === Capital.com LIVE trade execution (Slot C: TP 1.0×ATR / SL 1.0×ATR) ===
             # Order: API call first → confirm → then record paper trade
-            if capital_client and slot['name'] == 'B':
+            if capital_client and slot['name'] == 'C':
                 cap_result = capital_client.open_trade(
                     direction=exec_dir,
                     lot_size=0.01,
@@ -690,7 +690,7 @@ def run_strategies(db):
                 rsi_cond = '≤25' if sig.direction == 'LONG' else '≥75'
             else:
                 rsi_cond = '≤55' if sig.direction == 'LONG' else '≥45'
-            live_tag = ' 🔴LIVE' if (capital_client and slot['name'] == 'B') else ''
+            live_tag = ' 🔴LIVE' if (capital_client and slot['name'] == 'C') else ''
             header = f"{arrow} <b>NEW {slot_label} {exec_dir} ${trade_doc['entryPrice']:.2f} | RSI {rsi:.0f} ({rsi_cond}) | TP +${abs(exec_tp - sig.entry_price):.1f} | SL -${abs(exec_sl - sig.entry_price):.1f}{live_tag}</b>"
 
             live = get_live_price(db) or sig.entry_price
