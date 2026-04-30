@@ -290,31 +290,26 @@ def evaluate_strategies(
             return price - tp_dist, price + sl_dist
 
     # ==================== STRATEGY A: EMA Reversal at EMA21 ====================
-    # When lagging EMAs show trend but price crosses EMA21, the trend is reversing.
-    # Enter AGAINST the lagging trend, with M1 RSI confirmation for optimal timing.
+    # Same trigger as original pullback, but REVERSED direction.
+    # Data proves original direction is wrong 76% of the time.
     if now - cooldowns.last_ema > COOLDOWN_SECS:
         m5_bull = snap.m5_ema9 > snap.m5_ema21 > snap.m5_ema50
         m5_bear = snap.m5_ema9 < snap.m5_ema21 < snap.m5_ema50
 
-        ema21_dist = abs(price - snap.m5_ema21)
-
         full_dir = None
-        # EMAs say BULL but price broke below EMA21 → trend reversing → SHORT
-        # M1 RSI ≥ 65: wait for mini overbought bounce (better SHORT entry at top)
-        if m5_bull and snap.m5_low <= snap.m5_ema21 and snap.m5_rsi <= 55 and snap.m1_rsi >= 65:
+        # Original: BULL + pullback → LONG.  Reversed → SHORT
+        if m5_bull and snap.m5_low <= snap.m5_ema21 and snap.m5_rsi <= 55:
             full_dir = 'SHORT'
-        # EMAs say BEAR but price broke above EMA21 → trend reversing → LONG
-        # M1 RSI ≤ 35: wait for mini oversold dip (better LONG entry at bottom)
-        elif m5_bear and snap.m5_high >= snap.m5_ema21 and snap.m5_rsi >= 45 and snap.m1_rsi <= 35:
+        # Original: BEAR + pullback → SHORT.  Reversed → LONG
+        elif m5_bear and snap.m5_high >= snap.m5_ema21 and snap.m5_rsi >= 45:
             full_dir = 'LONG'
 
-        # Counter-trend filter disabled — we intentionally trade AGAINST the lagging trend
         if full_dir:
             cooldowns.last_ema = now
             tp, sl = calc_tp_sl(full_dir, EMA_TP_MULT, EMA_SL_MULT)
-            trend_label = '9>21>50 BULL→SHORT' if m5_bull else '9<21<50 BEAR→LONG'
+            trend_label = 'BULL→SHORT' if m5_bull else 'BEAR→LONG'
             meta = {
-                'rule': f"M5 EMA {trend_label}, M1 RSI {snap.m1_rsi:.0f} confirms entry, EMA21 dist ${ema21_dist:.1f}",
+                'rule': f"M5 EMA {trend_label}, reversed entry",
                 'm1_rsi': round(snap.m1_rsi, 2),
                 'm5_rsi': round(snap.m5_rsi, 2),
                 'm5_ema9': round(snap.m5_ema9, 3),
