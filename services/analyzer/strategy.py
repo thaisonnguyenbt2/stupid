@@ -289,23 +289,33 @@ def evaluate_strategies(
         else:
             return price - tp_dist, price + sl_dist
 
-    # ==================== STRATEGY A: EMA Trend Pullback ====================
-    # M5-only trigger: M5 trend alignment + M5 pullback to M5 EMA21 + M5 RSI reset
+    # ==================== STRATEGY A: EMA Reversal at EMA21 ====================
+    # When lagging EMAs show trend but price crosses EMA21, the trend is reversing.
+    # Enter AGAINST the lagging trend, with entry near EMA21 for optimal positioning.
     if now - cooldowns.last_ema > COOLDOWN_SECS:
         m5_bull = snap.m5_ema9 > snap.m5_ema21 > snap.m5_ema50
         m5_bear = snap.m5_ema9 < snap.m5_ema21 < snap.m5_ema50
 
+        # Price must be near EMA21 (within 0.3×ATR) for a quality entry
+        ema21_dist = abs(price - snap.m5_ema21)
+        near_ema21 = ema21_dist <= snap.m5_atr * 0.3
+
         full_dir = None
-        if m5_bull and snap.m5_low <= snap.m5_ema21 and snap.m5_rsi <= 55:
-            full_dir = 'LONG'
-        elif m5_bear and snap.m5_high >= snap.m5_ema21 and snap.m5_rsi >= 45:
+        # EMAs say BULL but price broke below EMA21 → trend reversing → SHORT
+        if m5_bull and snap.m5_low <= snap.m5_ema21 and snap.m5_rsi <= 55 and near_ema21:
             full_dir = 'SHORT'
+        # EMAs say BEAR but price broke above EMA21 → trend reversing → LONG
+        elif m5_bear and snap.m5_high >= snap.m5_ema21 and snap.m5_rsi >= 45 and near_ema21:
+            full_dir = 'LONG'
 
         if full_dir and not check_counter_trend(full_dir):
             cooldowns.last_ema = now
+            # Use EMA21 as entry price — the key level we're trading from
+            entry = round(snap.m5_ema21, 3)
             tp, sl = calc_tp_sl(full_dir, EMA_TP_MULT, EMA_SL_MULT)
+            trend_label = '9>21>50 BULL→SHORT' if m5_bull else '9<21<50 BEAR→LONG'
             meta = {
-                'rule': f"M5 EMA {'9>21>50 BULL' if m5_bull else '9<21<50 BEAR'}, M5 pullback to EMA21, M5 RSI reset",
+                'rule': f"M5 EMA {trend_label}, price at EMA21 ({ema21_dist:.1f} away), reversal entry",
                 'm1_rsi': round(snap.m1_rsi, 2),
                 'm5_rsi': round(snap.m5_rsi, 2),
                 'm5_ema9': round(snap.m5_ema9, 3),
@@ -318,7 +328,7 @@ def evaluate_strategies(
             }
             signals.append(Signal(
                 strategy='EMA_PULLBACK', direction=full_dir,
-                entry_price=price, tp=tp, sl=sl, meta=meta,
+                entry_price=entry, tp=tp, sl=sl, meta=meta,
             ))
 
     # ==================== STRATEGY B: Bollinger Mean Reversion (M5) ====================
