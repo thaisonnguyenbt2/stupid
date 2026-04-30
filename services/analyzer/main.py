@@ -660,7 +660,7 @@ def run_strategies(db):
             if capital_client and slot['name'] == 'C':
                 cap_result = capital_client.open_trade(
                     direction=exec_dir,
-                    lot_size=0.01,
+                    lot_size=1.0,  # 1 troy oz = $1/point
                     tp=exec_tp,
                     sl=exec_sl,
                     strategy=sig.strategy,
