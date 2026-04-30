@@ -308,7 +308,8 @@ def evaluate_strategies(
         elif m5_bear and snap.m5_high >= snap.m5_ema21 and snap.m5_rsi >= 45 and snap.m1_rsi <= 35:
             full_dir = 'LONG'
 
-        if full_dir and not check_counter_trend(full_dir):
+        # Counter-trend filter disabled — we intentionally trade AGAINST the lagging trend
+        if full_dir:
             cooldowns.last_ema = now
             tp, sl = calc_tp_sl(full_dir, EMA_TP_MULT, EMA_SL_MULT)
             trend_label = '9>21>50 BULL→SHORT' if m5_bull else '9<21<50 BEAR→LONG'
