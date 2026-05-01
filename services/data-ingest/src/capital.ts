@@ -238,6 +238,19 @@ export async function startCapitalStream(
       });
       onTrade(broadcastMsg);
 
+      // --- Weekend market closure: skip writes Fri 22:00 → Sun 22:00 UTC ---
+      const utcNow = new Date();
+      const day = utcNow.getUTCDay();    // 0=Sun, 5=Fri, 6=Sat
+      const hour = utcNow.getUTCHours();
+      const isWeekendClosed =
+        (day === 5 && hour >= 22) || // Friday 22:00+
+        (day === 6) ||               // All Saturday
+        (day === 0 && hour < 22);    // Sunday before 22:00
+      if (isWeekendClosed) {
+        // Keep WS alive but don't write stale data to DB
+        return;
+      }
+
       // Write live_tick for real-time price access (same as Finnhub)
       const db = mongoose.connection.db;
       if (db) {

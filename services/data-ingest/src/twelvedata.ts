@@ -95,6 +95,16 @@ export function startTwelveDataCron(symbol: string): void {
 
   const syncTask = async () => {
     try {
+      // --- Weekend market closure: skip writes Fri 22:00 → Sun 22:00 UTC ---
+      const utcNow = new Date();
+      const day = utcNow.getUTCDay();    // 0=Sun, 5=Fri, 6=Sat
+      const hour = utcNow.getUTCHours();
+      const isWeekendClosed =
+        (day === 5 && hour >= 22) || // Friday 22:00+
+        (day === 6) ||               // All Saturday
+        (day === 0 && hour < 22);    // Sunday before 22:00
+      if (isWeekendClosed) return;
+
       const url = `https://api.twelvedata.com/time_series?symbol=${tdSymbol}&interval=1min&outputsize=5&timezone=UTC&apikey=${API_KEY}`;
       const res = await axios.get(url);
       const data = res.data;
