@@ -636,8 +636,17 @@ def run_strategies(db):
             #     print(f"[{sig.strategy}·{slot_label}] ⛔ H1 trend {macro_trend} blocks {exec_dir} (only {allowed_dir} allowed)")
             #     continue
 
-
-
+            # --- GUARD 2: No new trades 2h before weekend close ---
+            # Market closes Friday ~22:00 UTC; block after 20:00 UTC Friday
+            utc_now = datetime.now(timezone.utc)
+            if utc_now.weekday() == 4 and utc_now.hour >= 20:  # Friday 20:00+
+                _restore_cooldown(cooldowns, sig.strategy, saved_cd)
+                if not getattr(run_strategies, '_weekend_logged', False):
+                    print(f"[{sig.strategy}·{slot_label}] ⛔ Weekend close guard — no new trades after Fri 20:00 UTC")
+                    run_strategies._weekend_logged = True
+                continue
+            elif utc_now.weekday() != 4:
+                run_strategies._weekend_logged = False
             if exec_dir == 'LONG':
                 exec_tp = sig.entry_price + tp_dist
                 exec_sl = sig.entry_price - sl_dist
