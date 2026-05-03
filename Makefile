@@ -2,7 +2,7 @@ ifneq (,$(wildcard ./.env))
     include .env
 endif
 
-.PHONY: dev dev-frontend dev-ingest dev-analyzer dev-notification install clean-ghosts chart
+.PHONY: dev dev-frontend dev-ingest dev-analyzer dev-notification install clean-ghosts chart backtester
 
 
 clean-ghosts:
@@ -102,6 +102,13 @@ chart:
 	@echo "[Chart] Serving Dry Run Visualization at http://localhost:8000"
 	@lsof -ti:8000 | xargs kill -9 2>/dev/null || true
 	python3 data/serve_ui.py
+
+backtester:
+	@echo "[Backtester] Killing existing process on :4005..."
+	@lsof -ti:4005 | xargs kill -9 2>/dev/null || true
+	@sleep 0.5
+	@echo "[Backtester] Starting at http://localhost:4005"
+	python3 services/backtester/server.py
 
 # ===================== KUBERNETES & GITOPS =====================
 

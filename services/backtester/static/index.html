@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>XAU/USD Backtester — Strategy Replay</title>
+  <meta name="description" content="Visual backtesting engine for XAU/USD trading strategies with historical tick data replay">
+  <link rel="stylesheet" href="/static/index.css">
+</head>
+<body>
+  <div class="app">
+    <!-- Top Bar -->
+    <header class="topbar">
+      <div class="topbar__logo">
+        XAU/USD <span>Backtester</span>
+      </div>
+      <div class="topbar__divider"></div>
+
+      <div class="control-group">
+        <label>Start</label>
+        <input type="date" id="startDate" class="control-input" value="2025-01-05">
+      </div>
+
+      <div class="control-group">
+        <label>End</label>
+        <input type="date" id="endDate" class="control-input" value="">
+      </div>
+
+      <!-- Timeframe -->
+      <div class="control-group">
+        <label>TF</label>
+        <select id="timeframe" class="control-input">
+          <option value="M1">M1</option>
+          <option value="M5" selected>M5</option>
+          <option value="M15">M15</option>
+        </select>
+      </div>
+
+      <div class="topbar__divider"></div>
+
+      <!-- Playback controls -->
+      <button id="btnPlay" class="btn btn--green">▶ Play</button>
+      <button id="btnDryRun" class="btn btn--primary">⚡ Dry Run</button>
+      <button id="btnPause" class="btn" style="display:none">⏸ Pause</button>
+      <button id="btnStop" class="btn" style="display:none">■ Stop</button>
+      <button id="btnExport" class="btn" style="display:none">📥 Export</button>
+
+      <div class="topbar__divider"></div>
+
+      <!-- Speed -->
+      <div class="control-group">
+        <label>Speed</label>
+        <div class="speed-btns" id="speedBtns">
+          <button class="btn btn--small" data-speed="1">1x</button>
+          <button class="btn btn--small" data-speed="5">5x</button>
+          <button class="btn btn--small" data-speed="10">10x</button>
+          <button class="btn btn--small btn--active" data-speed="100">100x</button>
+          <button class="btn btn--small" data-speed="200">200x</button>
+          <button class="btn btn--small" data-speed="400">400x</button>
+          <button class="btn btn--small" data-speed="MAX">MAX</button>
+        </div>
+      </div>
+
+      <!-- Current time + price -->
+      <div class="current-time">
+        <span class="status-dot" id="statusDot"></span>
+        <span id="currentTime">—</span>
+        <span class="price" id="currentPrice">—</span>
+      </div>
+    </header>
+
+    <!-- Chart -->
+    <main class="chart-area">
+      <div class="chart-legend">
+        <div class="chart-legend__item"><span class="chart-legend__dot" style="background:var(--ema9)"></span> EMA9</div>
+        <div class="chart-legend__item"><span class="chart-legend__dot" style="background:var(--ema21)"></span> EMA21</div>
+        <div class="chart-legend__item"><span class="chart-legend__dot" style="background:var(--ema50)"></span> EMA50</div>
+        <div class="chart-legend__item"><span class="chart-legend__dot" style="background:rgba(14,165,233,0.7)"></span> BB(20,2)</div>
+      </div>
+      <div id="chart"></div>
+    </main>
+
+    <!-- Right Panel -->
+    <aside class="right-panel">
+      <!-- Stats -->
+      <section class="stats-section">
+        <h3>Performance</h3>
+        <div class="stats-grid">
+          <div class="stat-card stat-card--wide stat-card--pnl">
+            <div class="stat-card__label">Total P/L</div>
+            <div class="stat-card__value" id="statPnl">$0.00</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-card__label">Trades</div>
+            <div class="stat-card__value stat-card__value--blue" id="statTrades">0</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-card__label">Win Rate</div>
+            <div class="stat-card__value stat-card__value--amber" id="statWinRate">0%</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-card__label">Wins</div>
+            <div class="stat-card__value stat-card__value--green" id="statWins">0</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-card__label">Losses</div>
+            <div class="stat-card__value stat-card__value--red" id="statLosses">0</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Slot Tabs -->
+      <div class="slot-tabs">
+        <div class="slot-tab slot-tab--active" data-slot="ALL">ALL</div>
+        <div class="slot-tab" data-slot="A">A (3:1)</div>
+        <div class="slot-tab" data-slot="B">B (1.5:1)</div>
+        <div class="slot-tab" data-slot="C">C (1:1)</div>
+      </div>
+
+      <!-- Trade List -->
+      <section class="trade-list-section">
+        <div class="trade-list-header">
+          <h3>Trade History</h3>
+          <span id="tradeCount" style="color: var(--text-muted); font-size: 12px;">0 trades</span>
+        </div>
+        <div class="trade-list" id="tradeList"></div>
+      </section>
+    </aside>
+  </div>
+
+  <!-- Lightweight Charts -->
+  <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -2,6 +2,7 @@
 
 # Raw tick data (too large for git)
 data/*.csv
+data/csv
 
 # Pickle caches (regenerated from CSV)
 data/*.pkl
