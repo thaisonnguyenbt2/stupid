@@ -30,6 +30,7 @@ services:
     env_file:
       - .env
     environment:
+      - CAPITAL_DEMO=false
       - MONGODB_URI=mongodb://trading-db:27017/trading
       - NOTIFICATION_URL=http://notification:4003/api/notify
     depends_on:
@@ -51,6 +52,7 @@ services:
     env_file:
       - .env
     environment:
+      - CAPITAL_DEMO=false
       - MONGODB_URI=mongodb://trading-db:27017/trading
       - NOTIFICATION_URL=http://notification:4003/api/notify
     depends_on:

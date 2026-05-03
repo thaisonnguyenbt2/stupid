@@ -45,14 +45,14 @@ let sessionTokens: SessionTokens | null = null;
  * Returns CST + X-SECURITY-TOKEN for authenticated requests.
  */
 async function createSession(): Promise<SessionTokens> {
-  const apiKey = process.env.CAPITAL_API_KEY;
   const password = process.env.CAPITAL_API_PASSWORD;
   const email = process.env.CAPITAL_EMAIL;
-  const isDemo = process.env.CAPITAL_DEMO !== 'false'; // Default to demo
+  const isDemo = process.env.CAPITAL_DEMO === 'true'; // Default to LIVE
+  const apiKey = isDemo ? process.env.CAPITAL_API_KEY_DEMO : process.env.CAPITAL_API_KEY_LIVE;
   const baseUrl = isDemo ? DEMO_REST_BASE : LIVE_REST_BASE;
 
   if (!apiKey || !password || !email) {
-    throw new Error('[Capital] Missing CAPITAL_API_KEY, CAPITAL_API_PASSWORD, or CAPITAL_EMAIL in .env');
+    throw new Error('[Capital] Missing CAPITAL_API_KEY_LIVE/DEMO, CAPITAL_API_PASSWORD, or CAPITAL_EMAIL in .env');
   }
 
   console.log(`[Capital] Creating session (${isDemo ? 'DEMO' : 'LIVE'})...`);
@@ -119,7 +119,8 @@ export async function startCapitalStream(
     return;
   }
 
-  const wsUrl = DEMO_WS_URL; // Demo for now; switch to LIVE_WS_URL for production
+  const isDemo = process.env.CAPITAL_DEMO === 'true';
+  const wsUrl = isDemo ? DEMO_WS_URL : LIVE_WS_URL;
   console.log(`[Capital] Connecting WebSocket to ${wsUrl}...`);
 
   const ws = new WebSocket(wsUrl);

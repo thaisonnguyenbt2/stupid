@@ -50,10 +50,10 @@ SPREAD_OFFSET = float(os.getenv('SPREAD_OFFSET', '0.0'))
 
 # Capital.com live trading
 CAPITAL_LIVE_ENABLED = os.getenv('CAPITAL_LIVE_ENABLED', 'false').lower() == 'true'
-CAPITAL_API_KEY = os.getenv('CAPITAL_API_KEY', '')
+CAPITAL_DEMO = os.getenv('CAPITAL_DEMO', 'false').lower() == 'true'  # Default to LIVE
+CAPITAL_API_KEY = os.getenv('CAPITAL_API_KEY_DEMO', '') if CAPITAL_DEMO else os.getenv('CAPITAL_API_KEY_LIVE', '')
 CAPITAL_API_PASSWORD = os.getenv('CAPITAL_API_PASSWORD', '')
 CAPITAL_EMAIL = os.getenv('CAPITAL_EMAIL', '')
-CAPITAL_DEMO = os.getenv('CAPITAL_DEMO', 'true').lower() != 'false'  # Default to demo
 CAPITAL_BASE_URL = 'https://demo-api-capital.backend-capital.com/api/v1' if CAPITAL_DEMO \
     else 'https://api-capital.backend-capital.com/api/v1'
 CAPITAL_EPIC = 'GOLD'  # XAU/USD on Capital.com
@@ -647,6 +647,19 @@ def run_strategies(db):
                 continue
             elif utc_now.weekday() != 4:
                 run_strategies._weekend_logged = False
+
+            # --- GUARD 3: No new trades for first 4h after market open ---
+            # Market opens Sunday 22:00 UTC. Wait until Monday 02:00 UTC for EMAs to stabilize after weekend gap.
+            is_sunday_open = (utc_now.weekday() == 6 and utc_now.hour >= 22)
+            is_monday_early = (utc_now.weekday() == 0 and utc_now.hour < 2)
+            if is_sunday_open or is_monday_early:
+                _restore_cooldown(cooldowns, sig.strategy, saved_cd)
+                if not getattr(run_strategies, '_market_open_logged', False):
+                    print(f"[{sig.strategy}·{slot_label}] ⛔ Market Open guard — waiting for EMAs to stabilize (until Mon 02:00 UTC)")
+                    run_strategies._market_open_logged = True
+                continue
+            else:
+                run_strategies._market_open_logged = False
             if exec_dir == 'LONG':
                 exec_tp = sig.entry_price + tp_dist
                 exec_sl = sig.entry_price - sl_dist
