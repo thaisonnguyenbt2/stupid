@@ -45,7 +45,9 @@ SPREAD_OFFSET = float(os.environ.get('SPREAD_OFFSET', '0.5'))
 
 # R:R Slots (same as production)
 RR_SLOTS = [
-    {'name': 'A', 'tp_mult': 3.0, 'sl_mult': 1.0, 'label': '3:1'},
+    {'name': 'A', 'tp_mult': 1.5, 'sl_mult': 1.5, 'label': '1.5:1.5'},
+    {'name': 'B', 'tp_mult': 3.0, 'sl_mult': 1.0, 'label': '3:1'},
+    {'name': 'C', 'tp_mult': 1.0, 'sl_mult': 1.0, 'label': '1:1'},
 ]
 
 # ===================== CSV READER =====================
@@ -260,10 +262,15 @@ class CandleBuilder:
 class TradeManager:
     """Tracks open and closed trades across all R:R slots."""
 
-    def __init__(self):
+    def __init__(self, mode='normal'):
+        self.mode = mode
+        self.open_trades = []
+    def __init__(self, mode='normal'):
+        self.mode = mode
         self.open_trades = []
         self.closed_trades = []
         self.trade_id = 0
+        self.is_reverse_mode = (mode == 'reverse')
 
     def open_trade(self, signal: Signal, slot: dict, timestamp: datetime):
         self.trade_id += 1
@@ -332,6 +339,17 @@ class TradeManager:
                 trade['exit_time'] = timestamp.isoformat()
                 self.closed_trades.append(trade)
                 closed.append(trade)
+
+                if trade['status'] == 'WIN':
+                    self.consecutive_losses = 0
+                elif trade['status'] == 'LOSS':
+                    self.consecutive_losses += 1
+                    if self.mode == 'reverse' and self.consecutive_losses >= 8:
+                        self.is_reverse_mode = not self.is_reverse_mode
+                        self.consecutive_losses = 0
+                        mode_str = 'REVERSE' if self.is_reverse_mode else 'NORMAL'
+                        print(f"🔄 Switched to {mode_str} MODE (8 consecutive losses) at {timestamp}")
+
             else:
                 still_open.append(trade)
 
@@ -385,7 +403,7 @@ _dryrun_state = {
 }
 
 
-def _run_dryrun_job(start_str, end_str):
+def run_dryrun(start_date: str, end_date: str = None, mode: str = 'normal', rr: str = 'ALL'):
     """Background thread: process all ticks and update shared state."""
     import time as _time
     t0 = _time.time()
@@ -394,22 +412,32 @@ def _run_dryrun_job(start_str, end_str):
     state['running'] = True
     state['result'] = None
 
-    start_date = datetime.strptime(start_str, '%Y-%m-%d').replace(tzinfo=timezone.utc)
-    end_date = datetime.strptime(end_str, '%Y-%m-%d').replace(tzinfo=timezone.utc) if end_str else None
-    warmup_date = start_date - timedelta(hours=6)
+    start_date_obj = datetime.strptime(start_date, '%Y-%m-%d').replace(tzinfo=timezone.utc)
+    end_date_obj = datetime.strptime(end_date, '%Y-%m-%d').replace(tzinfo=timezone.utc) if end_date else None
+    warmup_date = start_date_obj - timedelta(hours=6)
 
-    print(f'[DryRun] Start={start_str}, End={end_str or "ALL"}')
+    print(f'[DryRun] Start={start_date}, End={end_date or "ALL"}, Mode={mode}, RR={rr}')
+
+    if rr == 'ALL':
+        active_slots = RR_SLOTS
+    else:
+        try:
+            tp_str, sl_str = rr.replace(',', '.').split(':')
+            active_slots = [{'name': 'CUSTOM', 'label': rr, 'tp_mult': float(tp_str), 'sl_mult': float(sl_str)}]
+        except Exception as e:
+            print(f"Failed to parse custom RR: {e}")
+            active_slots = RR_SLOTS
 
     builder = CandleBuilder()
-    trade_mgr = TradeManager()
-    cooldowns = {s['name']: CooldownState() for s in RR_SLOTS}
+    trade_mgr = TradeManager(mode=mode)
+    cooldowns = {s['name']: CooldownState() for s in active_slots}
 
     tick_count = 0
     candle_count = 0
     warmup_done = False
     current_date = ''
 
-    for tick in tick_generator(warmup_date, end_date):
+    for tick in tick_generator(warmup_date, end_date_obj):
         # Check if cancelled
         if not state['running']:
             print('[DryRun] Cancelled')
@@ -443,12 +471,14 @@ def _run_dryrun_job(start_str, end_str):
                 snap = builder.build_snapshot(live_price=price)
                 if snap is not None:
                     bar_ts = completed['timestamp'].timestamp()
-                    for slot in RR_SLOTS:
+                    for slot in active_slots:
                         cd = cooldowns[slot['name']]
                         signals = evaluate_strategies(snap, cd, bar_ts, SPREAD_OFFSET)
                         for sig in signals:
+                            if trade_mgr.is_reverse_mode:
+                                sig.direction = 'SHORT' if sig.direction == 'LONG' else 'LONG'
                             trade_mgr.open_trade(sig, slot, completed['timestamp'])
-            if not warmup_done and dt >= start_date:
+            if not warmup_done and dt >= start_date_obj:
                 warmup_done = True
 
     elapsed = round(_time.time() - t0, 2)
@@ -488,7 +518,7 @@ def _run_dryrun_job(start_str, end_str):
 
 
 @app.post('/api/dryrun')
-async def start_dryrun(start: str = '2025-01-05', end: str = None):
+def start_dry_run(start: str = Query('2025-01-05'), end: str = Query(None), mode: str = Query('normal'), rr: str = Query('ALL')):
     """Start a background dry run job."""
     if _dryrun_state['running']:
         return {'error': 'A dry run is already in progress. Cancel it first.'}
@@ -496,7 +526,7 @@ async def start_dryrun(start: str = '2025-01-05', end: str = None):
     _dryrun_state['progress'] = {'ticks': 0, 'candles': 0, 'current_date': '', 'elapsed': 0, 'trades': 0, 'pnl': 0, 'winRate': 0, 'wins': 0, 'losses': 0}
     _dryrun_state['result'] = None
 
-    thread = threading.Thread(target=_run_dryrun_job, args=(start, end), daemon=True)
+    thread = threading.Thread(target=run_dryrun, args=(start, end, mode, rr), daemon=True)
     thread.start()
 
     return {'status': 'started', 'start': start, 'end': end or 'ALL'}
@@ -539,7 +569,9 @@ async def replay_ws(ws: WebSocket):
             await ws.send_json({'type': 'error', 'data': 'Expected start action'})
             return
 
-        start_str = msg.get('date', '2025-01-02')
+        start_str = msg.get('date', '2025-01-05')
+        mode_str = msg.get('mode', 'normal')
+        rr_str = msg.get('rr', 'ALL')
         speed = msg.get('speed', 100)
         tf = msg.get('tf', 'M5')
 
@@ -548,11 +580,21 @@ async def replay_ws(ws: WebSocket):
         # Start 2 hours earlier for indicator warmup
         warmup_date = start_date - timedelta(hours=6)
 
-        print(f'[Replay] Starting from {start_str}, speed={speed}x, tf={tf}')
+        print(f'[Replay] Starting from {start_str}, speed={speed}x, tf={tf}, mode={mode_str}, rr={rr_str}')
+
+        if rr_str == 'ALL':
+            active_slots = RR_SLOTS
+        else:
+            try:
+                tp_str, sl_str = rr_str.replace(',', '.').split(':')
+                active_slots = [{'name': 'CUSTOM', 'label': rr_str, 'tp_mult': float(tp_str), 'sl_mult': float(sl_str)}]
+            except Exception as e:
+                print(f"Failed to parse custom RR: {e}")
+                active_slots = RR_SLOTS
 
         builder = CandleBuilder()
-        trade_mgr = TradeManager()
-        cooldowns = {s['name']: CooldownState() for s in RR_SLOTS}
+        trade_mgr = TradeManager(mode=mode_str)
+        cooldowns = {s['name']: CooldownState() for s in active_slots}
 
         tick_count = 0
         candle_count = 0
@@ -615,12 +657,14 @@ async def replay_ws(ws: WebSocket):
                         bar_ts = completed['timestamp'].timestamp()
 
                         # Run strategy for each slot
-                        for slot in RR_SLOTS:
+                        for slot in active_slots:
                             cd = cooldowns[slot['name']]
                             saved_cd = (cd.last_ema, cd.last_bb, cd.last_inst)
                             signals = evaluate_strategies(snap, cd, bar_ts, SPREAD_OFFSET)
 
                             for sig in signals:
+                                if trade_mgr.is_reverse_mode:
+                                    sig.direction = 'SHORT' if sig.direction == 'LONG' else 'LONG'
                                 trade = trade_mgr.open_trade(sig, slot, completed['timestamp'])
                                 if warmup_done:
                                     await ws.send_json({'type': 'trade_open', 'data': trade})

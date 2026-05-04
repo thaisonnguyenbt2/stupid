@@ -1,0 +1,46 @@
+INFO:     Will watch for changes in these directories: ['/Users/thaisonnguyen/git/repo/thaisonnguyenbt2/stupid']
+INFO:     Uvicorn running on http://127.0.0.1:4005 (Press CTRL+C to quit)
+INFO:     Started reloader process [57662] using StatReload
+INFO:     Started server process [57664]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+WARNING:  StatReload detected changes in 'services/backtester/server.py'. Reloading...
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [57664]
+INFO:     Started server process [60161]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+WARNING:  StatReload detected changes in 'services/analyzer/main.py'. Reloading...
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [60161]
+INFO:     Started server process [60232]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+WARNING:  StatReload detected changes in 'services/analyzer/main.py'. Reloading...
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [60232]
+INFO:     Started server process [60519]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+WARNING:  StatReload detected changes in 'services/analyzer/main.py'. Reloading...
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [60519]
+INFO:     Started server process [60738]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+WARNING:  StatReload detected changes in 'services/backtester/server.py'. Reloading...
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [60738]
+INFO:     Started server process [88049]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.

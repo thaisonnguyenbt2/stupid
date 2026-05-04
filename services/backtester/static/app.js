@@ -178,6 +178,8 @@ function connect() {
       date: startDate,
       speed: currentSpeed,
       tf: displayTf,
+      mode: document.getElementById('tradeMode').value,
+      rr: document.getElementById('rrSlot').value,
     }));
     setPlayingState(true);
   };
@@ -299,7 +301,7 @@ function renderTradeList() {
   const list = document.getElementById('tradeList');
   const scrollTop = list.scrollTop;  // Preserve scroll position
   const filtered = selectedSlot === 'ALL' ? trades : trades.filter(t => t.slot === selectedSlot);
-  
+
   document.getElementById('tradeCount').textContent = `${filtered.length} trades`;
 
   // Only render last 100 for performance
@@ -339,7 +341,7 @@ function renderTradeList() {
 
 function clearTradeLines() {
   activeLines.forEach(line => {
-    try { candleSeries.removePriceLine(line); } catch (e) {}
+    try { candleSeries.removePriceLine(line); } catch (e) { }
   });
   activeLines = [];
 }
@@ -422,13 +424,13 @@ function highlightCandle(time, trade) {
     id: highlightMarkerId,
   });
   markers.sort((a, b) => a.time - b.time);
-  
+
   // Update with highlighted entry marker
   const updatedMarkers = markers.map(m => ({
     ...m,
-    color: m.id === trade.id ? '#3b82f6' : 
-           m.id === highlightMarkerId ? 'rgba(59,130,246,0.4)' :
-           (m.shape === 'arrowUp' ? '#22c55e' : m.shape === 'circle' ? m.color : '#ef4444'),
+    color: m.id === trade.id ? '#3b82f6' :
+      m.id === highlightMarkerId ? 'rgba(59,130,246,0.4)' :
+        (m.shape === 'arrowUp' ? '#22c55e' : m.shape === 'circle' ? m.color : '#ef4444'),
     size: m.id === trade.id ? 3 : (m.id === highlightMarkerId ? 3 : 1),
   }));
   candleSeries.setMarkers(updatedMarkers);
@@ -533,7 +535,7 @@ let dryRunPollTimer = null;
 document.getElementById('btnDryRun').addEventListener('click', async () => {
   const startDate = document.getElementById('startDate').value;
   const endDate = document.getElementById('endDate').value;
-  
+
   // Clear state
   markers = [];
   clearTradeLines();
@@ -553,7 +555,9 @@ document.getElementById('btnDryRun').addEventListener('click', async () => {
   document.getElementById('statusDot').className = 'status-dot status-dot--active';
 
   try {
-    let url = `/api/dryrun?start=${startDate}`;
+    const tradeMode = document.getElementById('tradeMode').value;
+    const rrSlot = document.getElementById('rrSlot').value;
+    let url = `/api/dryrun?start=${startDate}&mode=${tradeMode}&rr=${rrSlot}`;
     if (endDate) url += `&end=${endDate}`;
 
     const res = await fetch(url, { method: 'POST' });
@@ -592,11 +596,11 @@ function startDryRunPolling() {
       const p = data.progress;
 
       if (p && p.ticks > 0) {
-        document.getElementById('currentTime').textContent = 
+        document.getElementById('currentTime').textContent =
           `📍 ${p.current_date} · ${(p.ticks / 1000000).toFixed(1)}M ticks · ${p.candles.toLocaleString()} candles · ⏱ ${p.elapsed}s`;
-        document.getElementById('currentPrice').textContent = 
+        document.getElementById('currentPrice').textContent =
           `${p.trades} trades · ${p.winRate}% WR · $${p.pnl >= 0 ? '+' : ''}${p.pnl.toFixed(2)}`;
-        
+
         // Update stats panel live
         updateStats({
           total: p.trades,
@@ -612,7 +616,7 @@ function startDryRunPolling() {
         dryRunPollTimer = null;
         await fetchDryRunResult();
       }
-      
+
       if (!data.running && !data.done) {
         clearInterval(dryRunPollTimer);
         dryRunPollTimer = null;
@@ -640,7 +644,7 @@ async function fetchDryRunResult() {
     renderTradeList();
     updateStats(dryRunData.stats);
 
-    document.getElementById('currentTime').textContent = 
+    document.getElementById('currentTime').textContent =
       `✅ Done in ${dryRunData.elapsed_seconds}s · ${dryRunData.ticks.toLocaleString()} ticks · ${dryRunData.candles.toLocaleString()} candles`;
     document.getElementById('currentPrice').textContent = '';
 
@@ -671,7 +675,7 @@ document.getElementById('btnExport').addEventListener('click', () => {
   const exportData = {
     generated_at: new Date().toISOString(),
     config: {
-      slots: [{name: 'A', tp_mult: 3.0, sl_mult: 1.0}],
+      slots: [{ name: 'A', tp_mult: 3.0, sl_mult: 1.0 }],
       spread_offset: 0.5,
     },
     stats: dryRunData.stats,
