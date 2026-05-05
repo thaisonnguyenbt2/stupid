@@ -271,7 +271,16 @@ class TradeManager:
         self.pending_trades = []
         self.closed_trades = []
         self.trade_id = 0
+        self.mode = mode
         self.is_reverse_mode = (mode == 'reverse')
+        
+    def update_auto_mode(self, spread: float):
+        if self.mode != 'auto':
+            return
+        if spread > 0.70 and self.is_reverse_mode:
+            self.is_reverse_mode = False
+        elif spread < 0.30 and not self.is_reverse_mode:
+            self.is_reverse_mode = True
 
     def open_trade(self, signal: Signal, slot: dict, timestamp: datetime):
         self.trade_id += 1
@@ -505,6 +514,9 @@ def run_dryrun(start_date: str, end_date: str = None, mode: str = 'normal', rr: 
             if builder.rebuild_indicators():
                 snap = builder.build_snapshot(live_price=price)
                 if snap is not None:
+                    # Apply auto-switching hysteresis
+                    trade_mgr.update_auto_mode(snap.m5_ema_spread_smooth)
+                    
                     bar_ts = completed['timestamp'].timestamp()
                     for slot in active_slots:
                         cd = cooldowns[slot['name']]

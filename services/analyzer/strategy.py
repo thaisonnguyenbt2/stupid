@@ -81,6 +81,9 @@ class MarketSnapshot:
     m5_ema9_prev: Optional[float] = None   # EMA9 from 3 M5 bars ago
     m5_ema21_prev: Optional[float] = None  # EMA21 from 3 M5 bars ago
     has_slope_data: bool = False            # True if prev values are valid
+    
+    # Auto-Switching Metrics
+    m5_ema_spread_smooth: Optional[float] = None
 
     # Execution price (may differ from m1_close in live due to live tick)
     live_price: Optional[float] = None
@@ -153,6 +156,11 @@ def attach_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['upper_bb'] = df['bb_sma'] + (df['bb_std'] * 2.0)
     df['lower_bb'] = df['bb_sma'] - (df['bb_std'] * 2.0)
     df['vol_sma20'] = df['volume'].rolling(20).mean()
+    
+    # Auto-Switching Metrics (only strictly valid on M5, but we attach to both)
+    df['ema_spread_raw'] = abs(df['ema9'] - df['ema50']) / df['atr']
+    df['ema_spread_smooth'] = df['ema_spread_raw'].rolling(48).mean()
+    
     return df
 
 

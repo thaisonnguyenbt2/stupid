@@ -57,7 +57,9 @@ CAPITAL_EMAIL = os.getenv('CAPITAL_EMAIL', '')
 CAPITAL_BASE_URL = 'https://demo-api-capital.backend-capital.com/api/v1' if CAPITAL_DEMO \
     else 'https://api-capital.backend-capital.com/api/v1'
 CAPITAL_EPIC = 'GOLD'  # XAU/USD on Capital.com
-TRADE_MODE = os.getenv('TRADE_MODE', 'REVERSE')  # 'NORMAL' or 'REVERSE'
+
+# Dynamic Auto-Switching State
+current_trade_mode = 'NORMAL'
 
 # R:R Slots — each signal opens trades at different risk/reward ratios
 # All use M15 context, each slot trades independently
@@ -520,6 +522,7 @@ def build_snapshot(df_m1, df_m5, df_m5_shifted, db) -> MarketSnapshot:
         m5_ema9_prev=m5_ema9_prev,
         m5_ema21_prev=m5_ema21_prev,
         has_slope_data=has_slope,
+        m5_ema_spread_smooth=float(m5['ema_spread_smooth']) if not pd.isna(m5['ema_spread_smooth']) else 0.0,
         live_price=entry,
     )
 
@@ -580,6 +583,8 @@ def _restore_cooldown(cooldowns, strategy_name, saved):
 
 def run_strategies(db):
     """Execute all strategies across all context timeframes. Called every 5s."""
+    global current_trade_mode
+    
     df_m1 = load_candles(db, SYMBOL, 500)  # Fast: only 500 bars for trading
     if df_m1 is None or len(df_m1) < 50:
         print(f"[Analyzer] Insufficient data: {len(df_m1) if df_m1 is not None else 0} M1 candles. Need 50+.")
@@ -601,6 +606,16 @@ def run_strategies(db):
 
     now = time.time()
     
+    # === AUTO-SWITCHING HYSTERESIS (0.70 / 0.30) ===
+    if snap.m5_ema_spread_smooth > 0.70 and current_trade_mode != 'NORMAL':
+        print(f"🔄 Auto-Switch: Spread {snap.m5_ema_spread_smooth:.2f} > 0.70. Switching to NORMAL mode.")
+        current_trade_mode = 'NORMAL'
+        notify('trade', "🔄 Auto-Switch: NORMAL Mode", f"EMA Spread expanded to {snap.m5_ema_spread_smooth:.2f}", target_chat='2')
+    elif snap.m5_ema_spread_smooth < 0.30 and current_trade_mode != 'REVERSE':
+        print(f"🔄 Auto-Switch: Spread {snap.m5_ema_spread_smooth:.2f} < 0.30. Switching to REVERSE mode.")
+        current_trade_mode = 'REVERSE'
+        notify('trade', "🔄 Auto-Switch: REVERSE Mode", f"EMA Spread contracted to {snap.m5_ema_spread_smooth:.2f}", target_chat='2')
+
     # === PROCESS PENDING LIMIT ORDERS ===
     pending_trades = list(db.paper_trades.find({'symbol': SYMBOL, 'status': 'PENDING'}))
     for pt in pending_trades:
@@ -730,13 +745,14 @@ def run_strategies(db):
                 exec_sl = sig.entry_price + sl_dist
 
             # Calculate Limit Price for Pending Order
-            is_reverse = (TRADE_MODE == 'REVERSE')
+            is_reverse = (current_trade_mode == 'REVERSE')
             if is_reverse:
                 exec_dir = 'SHORT' if exec_dir == 'LONG' else 'LONG'
                 pullback_pct = 0.30
-                sig.meta['rule'] += " (REVERSED)"
+                sig.meta['rule'] += " (AUTO:REVERSE)"
             else:
                 pullback_pct = 0.15
+                sig.meta['rule'] += " (AUTO:NORMAL)"
                 
             limit_price = sig.entry_price - (pullback_pct * atr) if exec_dir == 'LONG' else sig.entry_price + (pullback_pct * atr)
 
@@ -747,7 +763,7 @@ def run_strategies(db):
                 'tp': round(exec_tp, 3), 'sl': round(exec_sl, 3),
                 'createTime': int(now * 1000),
                 'signalType': sig.strategy, 'meta': sig.meta, 'lotSize': LOT_SIZE,
-                'contextTf': slot_label, 'tradeMode': TRADE_MODE, 'isArchived': False,
+                'contextTf': slot_label, 'tradeMode': current_trade_mode, 'isArchived': False,
             }
 
             result = db.paper_trades.insert_one(trade_doc)
