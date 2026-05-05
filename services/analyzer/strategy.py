@@ -297,19 +297,19 @@ def evaluate_strategies(
         m5_bear = snap.m5_ema9 < snap.m5_ema21 < snap.m5_ema50
 
         full_dir = None
-        # Original: BULL + pullback → LONG.
+        # Original: BULL + pullback → LONG. Reversed → SHORT
         if m5_bull and snap.m5_low <= snap.m5_ema21 and snap.m5_rsi <= 55:
-            full_dir = 'LONG'
-        # Original: BEAR + pullback → SHORT.
-        elif m5_bear and snap.m5_high >= snap.m5_ema21 and snap.m5_rsi >= 45:
             full_dir = 'SHORT'
+        # Original: BEAR + pullback → SHORT. Reversed → LONG
+        elif m5_bear and snap.m5_high >= snap.m5_ema21 and snap.m5_rsi >= 45:
+            full_dir = 'LONG'
 
         if full_dir:
             cooldowns.last_ema = now
             tp, sl = calc_tp_sl(full_dir, EMA_TP_MULT, EMA_SL_MULT)
-            trend_label = '9>21>50 BULL' if m5_bull else '9<21<50 BEAR'
+            trend_label = 'BULL→SHORT' if m5_bull else 'BEAR→LONG'
             meta = {
-                'rule': f"M5 EMA {trend_label}, M5 pullback to EMA21",
+                'rule': f"M5 EMA {trend_label}, reversed entry",
                 'm1_rsi': round(snap.m1_rsi, 2),
                 'm5_rsi': round(snap.m5_rsi, 2),
                 'm5_ema9': round(snap.m5_ema9, 3),
