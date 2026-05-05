@@ -758,7 +758,25 @@ def run_strategies(db):
                 pullback_pct = 0.15
                 sig.meta['rule'] += " (AUTO:NORMAL)"
                 
-            limit_price = sig.entry_price - (pullback_pct * atr) if exec_dir == 'LONG' else sig.entry_price + (pullback_pct * atr)
+            # Grid Spacing: Check for existing OPEN or PENDING trades in this slot + direction
+            existing_trades = list(db.paper_trades.find({
+                'symbol': SYMBOL, 
+                'contextTf': slot_label, 
+                'direction': exec_dir,
+                'status': {'$in': ['OPEN', 'PENDING']}
+            }))
+            
+            if existing_trades:
+                if exec_dir == 'LONG':
+                    anchor_trade = min(existing_trades, key=lambda t: t.get('entryPrice') if t['status'] == 'OPEN' else t.get('limitPrice'))
+                    base_price = anchor_trade.get('entryPrice') if anchor_trade['status'] == 'OPEN' else anchor_trade.get('limitPrice')
+                    limit_price = base_price - (pullback_pct * atr)
+                else: # SHORT
+                    anchor_trade = max(existing_trades, key=lambda t: t.get('entryPrice') if t['status'] == 'OPEN' else t.get('limitPrice'))
+                    base_price = anchor_trade.get('entryPrice') if anchor_trade['status'] == 'OPEN' else anchor_trade.get('limitPrice')
+                    limit_price = base_price + (pullback_pct * atr)
+            else:
+                limit_price = sig.entry_price - (pullback_pct * atr) if exec_dir == 'LONG' else sig.entry_price + (pullback_pct * atr)
 
             trade_doc = {
                 'symbol': SYMBOL, 'direction': exec_dir, 'status': 'PENDING',

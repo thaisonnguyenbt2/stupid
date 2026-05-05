@@ -290,10 +290,25 @@ class TradeManager:
 
         # Limit price logic based on mode
         pullback_pct = 0.30 if self.is_reverse_mode else 0.15
-        if signal.direction == 'LONG':
-            limit_price = signal.entry_price - (pullback_pct * atr)
+        
+        # Grid Spacing: Check for existing OPEN or PENDING trades in this slot + direction
+        existing_trades = [t for t in self.open_trades + self.pending_trades 
+                           if t['slot'] == slot['name'] and t['direction'] == signal.direction]
+                           
+        if existing_trades:
+            if signal.direction == 'LONG':
+                anchor_trade = min(existing_trades, key=lambda t: t.get('entry_price') if t['status'] == 'OPEN' else t.get('limit_price'))
+                base_price = anchor_trade.get('entry_price') if anchor_trade['status'] == 'OPEN' else anchor_trade.get('limit_price')
+                limit_price = base_price - (pullback_pct * atr)
+            else: # SHORT
+                anchor_trade = max(existing_trades, key=lambda t: t.get('entry_price') if t['status'] == 'OPEN' else t.get('limit_price'))
+                base_price = anchor_trade.get('entry_price') if anchor_trade['status'] == 'OPEN' else anchor_trade.get('limit_price')
+                limit_price = base_price + (pullback_pct * atr)
         else:
-            limit_price = signal.entry_price + (pullback_pct * atr)
+            if signal.direction == 'LONG':
+                limit_price = signal.entry_price - (pullback_pct * atr)
+            else:
+                limit_price = signal.entry_price + (pullback_pct * atr)
 
         trade = {
             'id': self.trade_id,
