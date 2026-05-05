@@ -609,6 +609,9 @@ def run_strategies(db):
         if age > 900:
             db.paper_trades.update_one({'_id': pt['_id']}, {'$set': {'status': 'EXPIRED'}})
             print(f"[Limit] ⛔ EXPIRED pending {pt['direction']} after 15m")
+            notify('trade', f"{pt['symbol']} {pt['direction']} LIMIT EXPIRED", 
+                   f"Market did not pull back to {pt['limitPrice']:.2f} within 15 minutes.", 
+                   trade=pt, target_chat='2')
             continue
             
         limit_price = pt['limitPrice']
@@ -751,11 +754,10 @@ def run_strategies(db):
             trade_doc['_id'] = result.inserted_id
             print(f"[{sig.strategy}·{slot_label}] ⏳ PENDING Limit {exec_dir} @ {limit_price:.2f} (Signal {sig.entry_price:.2f})")
             
-            # Send notification for pending limit order
-            chat_id = SLOT_CHAT_MAP.get(slot['name'])
+            # Send notification for pending limit order to secondary channel
             notify('trade', f"{SYMBOL} {exec_dir} LIMIT PLACED", 
                    f"Waiting for pullback to {limit_price:.2f} ({pullback_pct*100}% ATR)", 
-                   trade=trade_doc, target_chat=chat_id)
+                   trade=trade_doc, target_chat='2')
 
 
 
