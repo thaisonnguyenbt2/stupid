@@ -59,12 +59,13 @@ CAPITAL_BASE_URL = 'https://demo-api-capital.backend-capital.com/api/v1' if CAPI
 CAPITAL_EPIC = 'GOLD'  # XAU/USD on Capital.com
 
 # Dynamic Auto-Switching State
-current_trade_mode = 'NORMAL'
+AUTO_SWITCH_ENABLED = False
+current_trade_mode = 'REVERSE'
 
 # R:R Slots — each signal opens trades at different risk/reward ratios
 # All use M15 context, each slot trades independently
 RR_SLOTS = [
-    {'name': 'A', 'tp_mult': 1.5, 'sl_mult': 1.5, 'label': '1.5:1.5'},
+    {'name': 'A', 'tp_mult': 1.0, 'sl_mult': 3.0, 'label': '1:3'},
     {'name': 'B', 'tp_mult': 3.0, 'sl_mult': 1.0, 'label': '3:1'},
     {'name': 'C', 'tp_mult': 1.0, 'sl_mult': 1.0, 'label': '1:1'},
 ]
@@ -72,7 +73,7 @@ CONTEXT_TF = '15min'  # Single context TF for all slots
 cooldowns_per_slot = {s['name']: CooldownState() for s in RR_SLOTS}
 
 # Slot → Telegram chat routing
-# A (3:1 R:R — live traded) → default CHAT_ID | B (1.5:1) → CHAT_ID_2 | C (1:1) → CHAT_ID_3
+# A (1:3 R:R — live traded) → default CHAT_ID | B (3:1) → CHAT_ID_2 | C (1:1) → CHAT_ID_3
 SLOT_CHAT_MAP = {'B': '2', 'C': '3'}
 
 
@@ -607,14 +608,15 @@ def run_strategies(db):
     now = time.time()
     
     # === AUTO-SWITCHING HYSTERESIS (0.70 / 0.30) ===
-    if snap.m5_ema_spread_smooth > 0.70 and current_trade_mode != 'NORMAL':
-        print(f"🔄 Auto-Switch: Spread {snap.m5_ema_spread_smooth:.2f} > 0.70. Switching to NORMAL mode.")
-        current_trade_mode = 'NORMAL'
-        notify('trade', "🔄 Auto-Switch: NORMAL Mode", f"EMA Spread expanded to {snap.m5_ema_spread_smooth:.2f}", target_chat='2')
-    elif snap.m5_ema_spread_smooth < 0.30 and current_trade_mode != 'REVERSE':
-        print(f"🔄 Auto-Switch: Spread {snap.m5_ema_spread_smooth:.2f} < 0.30. Switching to REVERSE mode.")
-        current_trade_mode = 'REVERSE'
-        notify('trade', "🔄 Auto-Switch: REVERSE Mode", f"EMA Spread contracted to {snap.m5_ema_spread_smooth:.2f}", target_chat='2')
+    if AUTO_SWITCH_ENABLED:
+        if snap.m5_ema_spread_smooth > 0.70 and current_trade_mode != 'NORMAL':
+            print(f"🔄 Auto-Switch: Spread {snap.m5_ema_spread_smooth:.2f} > 0.70. Switching to NORMAL mode.")
+            current_trade_mode = 'NORMAL'
+            notify('trade', "🔄 Auto-Switch: NORMAL Mode", f"EMA Spread expanded to {snap.m5_ema_spread_smooth:.2f}", target_chat='2')
+        elif snap.m5_ema_spread_smooth < 0.30 and current_trade_mode != 'REVERSE':
+            print(f"🔄 Auto-Switch: Spread {snap.m5_ema_spread_smooth:.2f} < 0.30. Switching to REVERSE mode.")
+            current_trade_mode = 'REVERSE'
+            notify('trade', "🔄 Auto-Switch: REVERSE Mode", f"EMA Spread contracted to {snap.m5_ema_spread_smooth:.2f}", target_chat='2')
 
     # === PROCESS PENDING LIMIT ORDERS ===
     pending_trades = list(db.paper_trades.find({'symbol': SYMBOL, 'status': 'PENDING'}))
