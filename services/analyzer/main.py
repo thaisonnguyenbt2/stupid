@@ -639,8 +639,10 @@ def run_strategies(db):
         if triggered:
             # Recalculate TP/SL based on actual triggered price
             exec_price = snap.m1_close
-            tp_dist = pt['meta']['m5_atr'] * pt['meta']['tp_mult'] - SPREAD_OFFSET
-            sl_dist = pt['meta']['m5_atr'] * pt['meta']['sl_mult'] + SPREAD_OFFSET
+            # Find the correct slot multiplier
+            slot_config = next((s for s in RR_SLOTS if pt['contextTf'].startswith(s['name'])), RR_SLOTS[0])
+            tp_dist = pt['meta']['m5_atr'] * slot_config['tp_mult'] - SPREAD_OFFSET
+            sl_dist = pt['meta']['m5_atr'] * slot_config['sl_mult'] + SPREAD_OFFSET
             
             if pt['direction'] == 'LONG':
                 exec_tp = exec_price + tp_dist
