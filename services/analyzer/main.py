@@ -50,7 +50,7 @@ SPREAD_OFFSET = float(os.getenv('SPREAD_OFFSET', '0.0'))
 
 # Capital.com live trading
 CAPITAL_LIVE_ENABLED = os.getenv('CAPITAL_LIVE_ENABLED', 'false').lower() == 'true'
-CAPITAL_DEMO = os.getenv('CAPITAL_DEMO', 'false').lower() == 'true'  # Default to LIVE
+CAPITAL_DEMO = True  # Hardcoded to DEMO account
 CAPITAL_API_KEY = os.getenv('CAPITAL_API_KEY_DEMO', '') if CAPITAL_DEMO else os.getenv('CAPITAL_API_KEY_LIVE', '')
 CAPITAL_API_PASSWORD = os.getenv('CAPITAL_API_PASSWORD', '')
 CAPITAL_EMAIL = os.getenv('CAPITAL_EMAIL', '')
