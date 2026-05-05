@@ -477,6 +477,20 @@ def run_dryrun(start_date: str, end_date: str = None, mode: str = 'normal', rr: 
                         for sig in signals:
                             if trade_mgr.is_reverse_mode:
                                 sig.direction = 'SHORT' if sig.direction == 'LONG' else 'LONG'
+                                
+                            # --- GUARD 4: Grid Spacing (Minimum 15% ATR advantage) ---
+                            slot_open_trades = [t for t in trade_mgr.open_trades if t['slot'] == slot['name'] and t['direction'] == sig.direction]
+                            if slot_open_trades:
+                                nearest = min(slot_open_trades, key=lambda t: abs(t['entry_price'] - sig.entry_price))
+                                if sig.direction == 'LONG':
+                                    advantage = nearest['entry_price'] - sig.entry_price
+                                else:
+                                    advantage = sig.entry_price - nearest['entry_price']
+                                
+                                req_adv = 0.15 * snap.m5_atr
+                                if advantage <= req_adv:
+                                    continue
+                                    
                             trade_mgr.open_trade(sig, slot, completed['timestamp'])
             if not warmup_done and dt >= start_date_obj:
                 warmup_done = True

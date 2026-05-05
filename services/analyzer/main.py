@@ -660,6 +660,28 @@ def run_strategies(db):
                 continue
             else:
                 run_strategies._market_open_logged = False
+
+            # --- GUARD 4: Grid Spacing (Minimum 15% ATR advantage) ---
+            open_trades = list(db.paper_trades.find({
+                'symbol': SYMBOL, 
+                'status': 'OPEN', 
+                'contextTf': slot_label, 
+                'direction': exec_dir
+            }))
+            
+            if open_trades:
+                nearest = min(open_trades, key=lambda t: abs(t['entryPrice'] - sig.entry_price))
+                if exec_dir == 'LONG':
+                    advantage = nearest['entryPrice'] - sig.entry_price
+                else:
+                    advantage = sig.entry_price - nearest['entryPrice']
+                
+                req_adv = 0.15 * atr
+                if advantage <= req_adv:
+                    _restore_cooldown(cooldowns, sig.strategy, saved_cd)
+                    print(f"[{sig.strategy}·{slot_label}] ⛔ Grid Guard — {exec_dir} @ {sig.entry_price:.2f} has advantage {advantage:.2f} over nearest {nearest['entryPrice']:.2f} (req > {req_adv:.2f})")
+                    continue
+
             if exec_dir == 'LONG':
                 exec_tp = sig.entry_price + tp_dist
                 exec_sl = sig.entry_price - sl_dist
