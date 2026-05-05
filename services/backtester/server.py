@@ -268,6 +268,7 @@ class TradeManager:
     def __init__(self, mode='normal'):
         self.mode = mode
         self.open_trades = []
+        self.pending_trades = []
         self.closed_trades = []
         self.trade_id = 0
         self.is_reverse_mode = (mode == 'reverse')
@@ -278,12 +279,12 @@ class TradeManager:
         tp_dist = atr * slot['tp_mult'] - SPREAD_OFFSET
         sl_dist = atr * slot['sl_mult'] + SPREAD_OFFSET
 
+        # Limit price logic based on mode
+        pullback_pct = 0.30 if self.is_reverse_mode else 0.15
         if signal.direction == 'LONG':
-            tp = signal.entry_price + tp_dist
-            sl = signal.entry_price - sl_dist
+            limit_price = signal.entry_price - (pullback_pct * atr)
         else:
-            tp = signal.entry_price - tp_dist
-            sl = signal.entry_price + sl_dist
+            limit_price = signal.entry_price + (pullback_pct * atr)
 
         trade = {
             'id': self.trade_id,
@@ -291,21 +292,55 @@ class TradeManager:
             'slot_label': slot['label'],
             'strategy': signal.strategy,
             'direction': signal.direction,
-            'entry_price': round(signal.entry_price, 2),
-            'tp': round(tp, 2),
-            'sl': round(sl, 2),
+            'signal_price': round(signal.entry_price, 2),
+            'limit_price': round(limit_price, 2),
+            'tp_mult': slot['tp_mult'],
+            'sl_mult': slot['sl_mult'],
             'tp_dist': round(tp_dist, 2),
             'sl_dist': round(sl_dist, 2),
             'atr': round(atr, 2),
-            'entry_time': timestamp.isoformat(),
-            'entry_ts': timestamp.timestamp(),
-            'status': 'OPEN',
+            'create_time': timestamp.isoformat(),
+            'create_ts': timestamp.timestamp(),
+            'status': 'PENDING',
             'meta': signal.meta,
         }
-        self.open_trades.append(trade)
+        self.pending_trades.append(trade)
         return trade
 
     def check_tp_sl(self, price: float, timestamp: datetime):
+        now_ts = timestamp.timestamp()
+        
+        # 1. Evaluate PENDING trades
+        still_pending = []
+        for pt in self.pending_trades:
+            if now_ts - pt['create_ts'] > 900:  # 15 minutes expired
+                continue
+                
+            triggered = False
+            if pt['direction'] == 'LONG' and price <= pt['limit_price']:
+                triggered = True
+            elif pt['direction'] == 'SHORT' and price >= pt['limit_price']:
+                triggered = True
+                
+            if triggered:
+                exec_price = price
+                tp_dist = pt['atr'] * pt['tp_mult'] - SPREAD_OFFSET
+                sl_dist = pt['atr'] * pt['sl_mult'] + SPREAD_OFFSET
+                
+                tp = exec_price + tp_dist if pt['direction'] == 'LONG' else exec_price - tp_dist
+                sl = exec_price - sl_dist if pt['direction'] == 'LONG' else exec_price + sl_dist
+                
+                pt['entry_price'] = round(exec_price, 2)
+                pt['tp'] = round(tp, 2)
+                pt['sl'] = round(sl, 2)
+                pt['entry_time'] = timestamp.isoformat()
+                pt['entry_ts'] = now_ts
+                pt['status'] = 'OPEN'
+                self.open_trades.append(pt)
+            else:
+                still_pending.append(pt)
+        self.pending_trades = still_pending
+
         """Check all open trades for TP/SL hits. Returns list of closed trades."""
         closed = []
         still_open = []

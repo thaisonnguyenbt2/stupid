@@ -57,6 +57,7 @@ CAPITAL_EMAIL = os.getenv('CAPITAL_EMAIL', '')
 CAPITAL_BASE_URL = 'https://demo-api-capital.backend-capital.com/api/v1' if CAPITAL_DEMO \
     else 'https://api-capital.backend-capital.com/api/v1'
 CAPITAL_EPIC = 'GOLD'  # XAU/USD on Capital.com
+TRADE_MODE = os.getenv('TRADE_MODE', 'REVERSE')  # 'NORMAL' or 'REVERSE'
 
 # R:R Slots — each signal opens trades at different risk/reward ratios
 # All use M15 context, each slot trades independently
@@ -599,6 +600,63 @@ def run_strategies(db):
         return
 
     now = time.time()
+    
+    # === PROCESS PENDING LIMIT ORDERS ===
+    pending_trades = list(db.paper_trades.find({'symbol': SYMBOL, 'status': 'PENDING'}))
+    for pt in pending_trades:
+        # Check expiration (15 mins = 900 seconds)
+        age = now - (pt.get('createTime', now * 1000) / 1000)
+        if age > 900:
+            db.paper_trades.update_one({'_id': pt['_id']}, {'$set': {'status': 'EXPIRED'}})
+            print(f"[Limit] ⛔ EXPIRED pending {pt['direction']} after 15m")
+            continue
+            
+        limit_price = pt['limitPrice']
+        triggered = False
+        if pt['direction'] == 'LONG' and snap.m1_close <= limit_price:
+            triggered = True
+        elif pt['direction'] == 'SHORT' and snap.m1_close >= limit_price:
+            triggered = True
+            
+        if triggered:
+            # Recalculate TP/SL based on actual triggered price
+            exec_price = snap.m1_close
+            tp_dist = pt['meta']['m5_atr'] * pt['meta']['tp_mult'] - SPREAD_OFFSET
+            sl_dist = pt['meta']['m5_atr'] * pt['meta']['sl_mult'] + SPREAD_OFFSET
+            
+            if pt['direction'] == 'LONG':
+                exec_tp = exec_price + tp_dist
+                exec_sl = exec_price - sl_dist
+            else:
+                exec_tp = exec_price - tp_dist
+                exec_sl = exec_price + sl_dist
+                
+            updates = {
+                'status': 'OPEN',
+                'entryPrice': round(exec_price, 3),
+                'tp': round(exec_tp, 3),
+                'sl': round(exec_sl, 3),
+                'entryTime': int(now * 1000)
+            }
+            
+            # Execute on Capital.com if Slot A
+            if capital_client and pt['contextTf'].startswith('A'):
+                cap_result = capital_client.open_trade(
+                    direction=pt['direction'], lot_size=1.0, tp=exec_tp, sl=exec_sl,
+                    strategy=pt['signalType'], slot=pt['contextTf']
+                )
+                if cap_result.get('error'):
+                    db.paper_trades.update_one({'_id': pt['_id']}, {'$set': {'status': 'FAILED'}})
+                    print(f"[Limit] ⛔ Capital.com rejected: {cap_result['error']}")
+                    continue
+                updates['capitalDealRef'] = cap_result.get('dealReference', '')
+                updates['capitalStatus'] = cap_result.get('status', 'SENT')
+                
+            db.paper_trades.update_one({'_id': pt['_id']}, {'$set': updates})
+            print(f"[Limit] ✅ TRIGGERED {pt['direction']} @ {exec_price:.2f} (Limit was {limit_price:.2f})")
+            pt.update(updates)
+            notify('trade', f"{pt['symbol']} {pt['direction']} LIMIT EXECUTED", 
+                   f"Limit hit at {exec_price:.2f}", trade=pt, target_chat=SLOT_CHAT_MAP.get(pt['contextTf'][:1]))
 
     # Evaluate signals once, then execute across all R:R slots
     for slot in RR_SLOTS:
@@ -661,27 +719,6 @@ def run_strategies(db):
             else:
                 run_strategies._market_open_logged = False
 
-            # --- GUARD 4: Grid Spacing (Minimum 15% ATR advantage) ---
-            open_trades = list(db.paper_trades.find({
-                'symbol': SYMBOL, 
-                'status': 'OPEN', 
-                'contextTf': slot_label, 
-                'direction': exec_dir
-            }))
-            
-            if open_trades:
-                nearest = min(open_trades, key=lambda t: abs(t['entryPrice'] - sig.entry_price))
-                if exec_dir == 'LONG':
-                    advantage = nearest['entryPrice'] - sig.entry_price
-                else:
-                    advantage = sig.entry_price - nearest['entryPrice']
-                
-                req_adv = 0.15 * atr
-                if advantage <= req_adv:
-                    _restore_cooldown(cooldowns, sig.strategy, saved_cd)
-                    print(f"[{sig.strategy}·{slot_label}] ⛔ Grid Guard — {exec_dir} @ {sig.entry_price:.2f} has advantage {advantage:.2f} over nearest {nearest['entryPrice']:.2f} (req > {req_adv:.2f})")
-                    continue
-
             if exec_dir == 'LONG':
                 exec_tp = sig.entry_price + tp_dist
                 exec_sl = sig.entry_price - sl_dist
@@ -689,59 +726,38 @@ def run_strategies(db):
                 exec_tp = sig.entry_price - tp_dist
                 exec_sl = sig.entry_price + sl_dist
 
+            # Calculate Limit Price for Pending Order
+            is_reverse = (TRADE_MODE == 'REVERSE')
+            if is_reverse:
+                exec_dir = 'SHORT' if exec_dir == 'LONG' else 'LONG'
+                pullback_pct = 0.30
+                sig.meta['rule'] += " (REVERSED)"
+            else:
+                pullback_pct = 0.15
+                
+            limit_price = sig.entry_price - (pullback_pct * atr) if exec_dir == 'LONG' else sig.entry_price + (pullback_pct * atr)
 
             trade_doc = {
-                'symbol': SYMBOL, 'direction': exec_dir, 'status': 'OPEN',
-                'entryPrice': round(sig.entry_price, 3),
+                'symbol': SYMBOL, 'direction': exec_dir, 'status': 'PENDING',
+                'entryPrice': round(sig.entry_price, 3), # Original signal price
+                'limitPrice': round(limit_price, 3),     # Price needed to trigger
                 'tp': round(exec_tp, 3), 'sl': round(exec_sl, 3),
-                'entryTime': int(now * 1000),
+                'createTime': int(now * 1000),
                 'signalType': sig.strategy, 'meta': sig.meta, 'lotSize': LOT_SIZE,
-                'contextTf': slot_label, 'tradeMode': 'NORMAL', 'isArchived': False,
+                'contextTf': slot_label, 'tradeMode': TRADE_MODE, 'isArchived': False,
             }
 
-            # === Capital.com LIVE trade execution (Slot A: TP 3.0×ATR / SL 1.0×ATR) ===
-            # Order: API call first → confirm → then record paper trade
-            if capital_client and slot['name'] == 'A':
-                cap_result = capital_client.open_trade(
-                    direction=exec_dir,
-                    lot_size=1.0,  # 1 troy oz = $1/point
-                    tp=exec_tp,
-                    sl=exec_sl,
-                    strategy=sig.strategy,
-                    slot=slot_label,
-                )
-                if cap_result.get('error'):
-                    # API failed — skip this trade entirely
-                    _restore_cooldown(cooldowns, sig.strategy, saved_cd)
-                    print(f"[{sig.strategy}·{slot_label}] ⛔ Capital.com rejected: {cap_result['error']}")
-                    continue
+            result = db.paper_trades.insert_one(trade_doc)
+            trade_doc['_id'] = result.inserted_id
+            print(f"[{sig.strategy}·{slot_label}] ⏳ PENDING Limit {exec_dir} @ {limit_price:.2f} (Signal {sig.entry_price:.2f})")
+            
+            # Send notification for pending limit order
+            chat_id = SLOT_CHAT_MAP.get(slot['name'])
+            notify('trade', f"{SYMBOL} {exec_dir} LIMIT PLACED", 
+                   f"Waiting for pullback to {limit_price:.2f} ({pullback_pct*100}% ATR)", 
+                   trade=trade_doc, target_chat=chat_id)
 
-                # API confirmed — enrich paper trade with deal reference
-                trade_doc['capitalDealRef'] = cap_result.get('dealReference', '')
-                trade_doc['capitalStatus'] = cap_result.get('status', 'SENT')
-                # Use actual fill price if available
-                confirm = cap_result.get('confirm', {})
-                if confirm.get('level'):
-                    trade_doc['entryPrice'] = round(confirm['level'], 3)
 
-            # Record paper trade (after Capital.com confirmation for Slot C)
-            db.paper_trades.insert_one(trade_doc)
-
-            # Notification
-            arrow = '↑' if exec_dir == 'LONG' else '↓'
-            rsi = sig.meta.get('m1_rsi', 0)
-            if sig.strategy == 'BB_REVERSION':
-                rsi_cond = '≤25' if sig.direction == 'LONG' else '≥75'
-            else:
-                rsi_cond = '≤55' if sig.direction == 'LONG' else '≥45'
-            live_tag = ' 🔴LIVE' if (capital_client and slot['name'] == 'A') else ''
-            header = f"{arrow} <b>NEW {slot_label} {exec_dir} ${trade_doc['entryPrice']:.2f} | RSI {rsi:.0f} ({rsi_cond}) | TP +${abs(exec_tp - sig.entry_price):.1f} | SL -${abs(exec_sl - sig.entry_price):.1f}{live_tag}</b>"
-
-            live = get_live_price(db) or sig.entry_price
-            msg = build_tf_message(header, db, tf=slot_label, live_price=live)
-            target_chat = SLOT_CHAT_MAP.get(slot['name'])
-            notify('TRADE_OPEN', None, msg, trade_doc, target_chat=target_chat)
-            print(f"[{sig.strategy}·{slot_label}] {exec_dir} at {trade_doc['entryPrice']:.3f} | TP: {exec_tp:.3f} | SL: {exec_sl:.3f}")
 
 
 # ===================== REAL-TIME BROADCAST =====================
