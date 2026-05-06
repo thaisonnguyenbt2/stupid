@@ -626,9 +626,7 @@ def run_strategies(db):
         if age > 900:
             db.paper_trades.update_one({'_id': pt['_id']}, {'$set': {'status': 'EXPIRED'}})
             print(f"[Limit] ⛔ EXPIRED pending {pt['direction']} after 15m")
-            notify('trade', f"{pt['symbol']} {pt['direction']} LIMIT EXPIRED", 
-                   f"Market did not pull back to {pt['limitPrice']:.2f} within 15 minutes.", 
-                   trade=pt, target_chat='2')
+
             continue
             
         limit_price = pt['limitPrice']
@@ -677,8 +675,8 @@ def run_strategies(db):
             db.paper_trades.update_one({'_id': pt['_id']}, {'$set': updates})
             print(f"[Limit] ✅ TRIGGERED {pt['direction']} @ {exec_price:.2f} (Limit was {limit_price:.2f})")
             pt.update(updates)
-            notify('trade', f"{pt['symbol']} {pt['direction']} LIMIT EXECUTED", 
-                   f"Limit hit at {exec_price:.2f}", trade=pt, target_chat=SLOT_CHAT_MAP.get(pt['contextTf'][:1]))
+            notify('trade', f"🚨 NEW TRADE OPENED: {pt['symbol']} {pt['direction']}", 
+                   f"Entry: {exec_price:.2f} | TP: {exec_tp:.2f} | SL: {exec_sl:.2f}", trade=pt, target_chat=SLOT_CHAT_MAP.get(pt['contextTf'][:1]))
 
     # Evaluate signals once, then execute across all R:R slots
     for slot in RR_SLOTS:
@@ -752,10 +750,10 @@ def run_strategies(db):
             is_reverse = (current_trade_mode == 'REVERSE')
             if is_reverse:
                 exec_dir = 'SHORT' if exec_dir == 'LONG' else 'LONG'
-                pullback_pct = 0.30
+                pullback_pct = 0.10
                 sig.meta['rule'] += " (AUTO:REVERSE)"
             else:
-                pullback_pct = 0.15
+                pullback_pct = 0.05
                 sig.meta['rule'] += " (AUTO:NORMAL)"
                 
             # Grid Spacing: Check for existing OPEN or PENDING trades in this slot + direction

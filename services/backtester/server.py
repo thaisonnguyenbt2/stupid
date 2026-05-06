@@ -265,14 +265,11 @@ class TradeManager:
     def __init__(self, mode='normal'):
         self.mode = mode
         self.open_trades = []
-    def __init__(self, mode='normal'):
-        self.mode = mode
-        self.open_trades = []
         self.pending_trades = []
         self.closed_trades = []
         self.trade_id = 0
-        self.mode = mode
         self.is_reverse_mode = (mode == 'reverse')
+        self.consecutive_losses = 0
         
     def update_auto_mode(self, spread: float):
         if self.mode != 'auto':
@@ -289,7 +286,7 @@ class TradeManager:
         sl_dist = atr * slot['sl_mult'] + SPREAD_OFFSET
 
         # Limit price logic based on mode
-        pullback_pct = 0.30 if self.is_reverse_mode else 0.15
+        pullback_pct = 0.10 if self.is_reverse_mode else 0.05
         
         # Grid Spacing: Check for existing OPEN or PENDING trades in this slot + direction
         existing_trades = [t for t in self.open_trades + self.pending_trades 
