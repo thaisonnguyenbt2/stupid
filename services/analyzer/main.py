@@ -65,7 +65,7 @@ current_trade_mode = 'NORMAL'
 # R:R Slots — each signal opens trades at different risk/reward ratios
 # All use M15 context, each slot trades independently
 RR_SLOTS = [
-    {'name': 'A', 'tp_mult': 1.0, 'sl_mult': 3.0, 'label': '1:3'},
+    {'name': 'A', 'tp_mult': 2.5, 'sl_mult': 1.5, 'label': '2.5:1.5'},
     {'name': 'B', 'tp_mult': 3.0, 'sl_mult': 1.0, 'label': '3:1'},
     {'name': 'C', 'tp_mult': 1.0, 'sl_mult': 1.0, 'label': '1:1'},
 ]
