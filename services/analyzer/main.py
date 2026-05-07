@@ -60,7 +60,7 @@ CAPITAL_EPIC = 'GOLD'  # XAU/USD on Capital.com
 
 # Dynamic Auto-Switching State
 AUTO_SWITCH_ENABLED = False
-current_trade_mode = 'REVERSE'
+current_trade_mode = 'NORMAL'
 
 # R:R Slots — each signal opens trades at different risk/reward ratios
 # All use M15 context, each slot trades independently
@@ -750,10 +750,10 @@ def run_strategies(db):
             is_reverse = (current_trade_mode == 'REVERSE')
             if is_reverse:
                 exec_dir = 'SHORT' if exec_dir == 'LONG' else 'LONG'
-                pullback_pct = 0.10
+                pullback_pct = 0.20
                 sig.meta['rule'] += " (AUTO:REVERSE)"
             else:
-                pullback_pct = 0.05
+                pullback_pct = 0.10
                 sig.meta['rule'] += " (AUTO:NORMAL)"
                 
             # Grid Spacing: Check for existing OPEN or PENDING trades in this slot + direction

@@ -286,7 +286,7 @@ class TradeManager:
         sl_dist = atr * slot['sl_mult'] + SPREAD_OFFSET
 
         # Limit price logic based on mode
-        pullback_pct = 0.10 if self.is_reverse_mode else 0.05
+        pullback_pct = 0.20 if self.is_reverse_mode else 0.10
         
         # Grid Spacing: Check for existing OPEN or PENDING trades in this slot + direction
         existing_trades = [t for t in self.open_trades + self.pending_trades 
