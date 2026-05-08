@@ -45,9 +45,9 @@ SPREAD_OFFSET = float(os.environ.get('SPREAD_OFFSET', '0.5'))
 
 # R:R Slots (same as production)
 RR_SLOTS = [
-    {'name': 'A', 'tp_mult': 2.5, 'sl_mult': 1.5, 'label': '2.5:1.5'},
+    {'name': 'A', 'tp_mult': 1.0, 'sl_mult': 1.0, 'label': '1:1'},
     {'name': 'B', 'tp_mult': 3.0, 'sl_mult': 1.0, 'label': '3:1'},
-    {'name': 'C', 'tp_mult': 1.0, 'sl_mult': 1.0, 'label': '1:1'},
+    {'name': 'C', 'tp_mult': 2.0, 'sl_mult': 1.0, 'label': '2:1'},
 ]
 
 # ===================== CSV READER =====================
