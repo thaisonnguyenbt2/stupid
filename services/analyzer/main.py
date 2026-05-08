@@ -637,6 +637,18 @@ def run_strategies(db):
             triggered = True
             
         if triggered:
+            # 3-minute execution guard to prevent clumped triggers during spikes
+            recent_trade = db.paper_trades.find_one({
+                'symbol': SYMBOL,
+                'contextTf': pt['contextTf'],
+                'entryTime': {'$gt': (now - 180) * 1000}
+            })
+            
+            if recent_trade:
+                db.paper_trades.update_one({'_id': pt['_id']}, {'$set': {'status': 'CANCELLED_SPIKE'}})
+                print(f"[Limit] ⛔ CANCELLED {pt['direction']} limit to prevent clumped execution (3m guard)")
+                continue
+
             # Recalculate TP/SL based on actual triggered price
             exec_price = snap.m1_close
             # Find the correct slot multiplier

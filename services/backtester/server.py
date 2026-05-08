@@ -344,6 +344,13 @@ class TradeManager:
                 triggered = True
                 
             if triggered:
+                # 3-minute execution guard to prevent clumped triggers during spikes
+                recent_trades = [t for t in self.open_trades + self.closed_trades 
+                                 if t['slot'] == pt['slot'] and (now_ts - t.get('entry_ts', 0)) < 180]
+                if recent_trades:
+                    # Cancel limit due to 3m execution guard
+                    continue
+                    
                 exec_price = price
                 tp_dist = pt['atr'] * pt['tp_mult'] - SPREAD_OFFSET
                 sl_dist = pt['atr'] * pt['sl_mult'] + SPREAD_OFFSET
