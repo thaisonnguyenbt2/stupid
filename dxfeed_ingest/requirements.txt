@@ -1,0 +1,7 @@
+requests==2.31.0
+sseclient-py==1.8.0
+pandas==2.2.1
+numpy==1.26.4
+python-dotenv==1.0.1
+websocket-client==1.7.0
+pymongo==4.6.2

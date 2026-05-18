@@ -9,7 +9,7 @@ REPO_DIR="/home/ubuntu/trading"
 COMPOSE_FILE="docker-compose.prod.yml"
 LOG_FILE="/var/log/auto-deploy.log"
 BRANCH="main"
-EXPECTED_CONTAINERS=("xau-analyzer" "xau-data-ingest" "xau-notification" "xau-trading-db")
+EXPECTED_CONTAINERS=("xau-order-flow" "xau-notification" "xau-trading-db")
 
 log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
