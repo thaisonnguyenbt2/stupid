@@ -4,7 +4,7 @@ import threading
 class SessionTracker:
     def __init__(self, tick_size=0.1):
         self.tick_size = tick_size
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         
         self.cumulative_volume = 0.0
         self.cumulative_pv = 0.0  # Price * Volume
@@ -91,7 +91,7 @@ class OrderFlowTracker:
     def __init__(self, tick_size=0.1, history_size=14):
         self.tick_size = tick_size
         self.history_size = history_size
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         
         self.session = SessionTracker(tick_size)
         
