@@ -145,20 +145,19 @@ class TradingStateMachine:
         # State Machine Logic
         if self.state == "SCANNING":
             # --- LONG SETUP RULES ---
-            # Context: price > VWAP, price near VAL
-            is_above_vwap = close > vwap
+            # Context: price near VAL (Value Area Low indicates discount)
             is_near_val = abs(close - val) < (atr * 0.5)
             
-            # Pressure: delta very negative
-            is_delta_very_negative = delta < -abs(avg_delta * 1.5)
-            if avg_delta == 0 and delta < -5.0: # Fallback
+            # Pressure: delta very negative (significant net selling, at least 25% of avg candle volume)
+            is_delta_very_negative = delta < -(avg_vol * 0.25)
+            if avg_vol == 0 and delta < -5.0: # Fallback
                 is_delta_very_negative = True
                 
             # Response: price not falling (close near high means absorption buy)
             is_close_near_high = (high - close) <= (atr * 0.2)
             
-            if is_above_vwap and is_near_val and is_delta_very_negative and is_close_near_high:
-                msg = f"⏳ <b>PENDING LONG</b>\nPrice: {close:.2f}\nVWAP: {vwap:.2f}\nVAL: {val:.2f}\nDelta: {delta:.2f}\nWaiting for confirmation..."
+            if is_near_val and is_delta_very_negative and is_close_near_high:
+                msg = f"⏳ <b>PENDING LONG</b>\nPrice: {close:.2f}\nVAL: {val:.2f}\nDelta: {delta:.2f}\nWaiting for confirmation..."
                 send_telegram_message(msg)
                 logger.info("PENDING LONG Setup Detected.")
                 self.state = "PENDING_LONG"
@@ -166,20 +165,19 @@ class TradingStateMachine:
                 return
                 
             # --- SHORT SETUP RULES ---
-            # Context: price near VAH, price below VWAP
-            is_below_vwap = close < vwap
+            # Context: price near VAH (Value Area High indicates premium)
             is_near_vah = abs(close - vah) < (atr * 0.5)
             
-            # Pressure: delta positive
-            is_delta_very_positive = delta > abs(avg_delta * 1.5)
-            if avg_delta == 0 and delta > 5.0:
+            # Pressure: delta positive (significant net buying, at least 25% of avg candle volume)
+            is_delta_very_positive = delta > (avg_vol * 0.25)
+            if avg_vol == 0 and delta > 5.0: # Fallback
                  is_delta_very_positive = True
             
             # Response: price cannot continue higher (close near low means absorption sell)
             is_close_near_low = (close - low) <= (atr * 0.2)
             
-            if is_below_vwap and is_near_vah and is_delta_very_positive and is_close_near_low:
-                msg = f"⏳ <b>PENDING SHORT</b>\nPrice: {close:.2f}\nVWAP: {vwap:.2f}\nVAH: {vah:.2f}\nDelta: {delta:.2f}\nWaiting for confirmation..."
+            if is_near_vah and is_delta_very_positive and is_close_near_low:
+                msg = f"⏳ <b>PENDING SHORT</b>\nPrice: {close:.2f}\nVAH: {vah:.2f}\nDelta: {delta:.2f}\nWaiting for confirmation..."
                 send_telegram_message(msg)
                 logger.info("PENDING SHORT Setup Detected.")
                 self.state = "PENDING_SHORT"
