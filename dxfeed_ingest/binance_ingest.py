@@ -120,7 +120,7 @@ class TradingStateMachine:
                 logger.info(f"📲 Telegram sent for slot A (1:1). No Capital execution.")
                 doc['capitalStatus'] = 'TELEGRAM_ONLY'
             
-            if db:
+            if db is not None:
                 db.paper_trades.insert_one(doc)
 
     def evaluate(self, tracker: OrderFlowTracker, db, snap):
@@ -255,7 +255,7 @@ def db_sync_loop(tracker: OrderFlowTracker, db):
             'imbalances': snap['imbalances']
         }
         
-        if db:
+        if db is not None:
             try:
                 db.order_flow_candles.insert_one(doc)
                 logger.info(f"Saved 1m: Delta {snap['delta']:.2f} | Close: {snap['close']:.2f} | Imbalances: {len(snap['imbalances'])}")
